@@ -97,6 +97,7 @@ private final class SuggestionController {
     private var isGenerating = false
     private var lastAccessibilityTrusted: Bool?
     private var lastEventTapAttempt: Date?
+    private var lastOverlayDiagnosticKey: String?
 
     init(engine: any TextCompletionEngine) {
         self.engine = engine
@@ -174,6 +175,7 @@ private final class SuggestionController {
         if keycode == kVK_Delete {
             clearSuggestion()
         } else if event.unicodeString?.isEmpty == false {
+            overlay.hide()
             generationTask?.cancel()
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.02) { [weak self] in
                 self?.refreshFocusedText()
@@ -343,12 +345,41 @@ private final class SuggestionController {
     }
 
     private func showSuggestion(_ suggestion: String) {
-        guard let context = focusedContext, let caretRect = context.caretRect else {
+        guard let context = focusedContext, let caret = context.caret else {
             suggestionLogger.debug("Could not show suggestion because caret rect is missing")
             return
         }
+        let caretRect = caret.screenRect
         suggestionLogger.debug("Showing suggestion length=\(suggestion.count)")
-        overlay.update(text: suggestion, font: context.font ?? .systemFont(ofSize: NSFont.systemFontSize), caretRect: caretRect)
+        let font = OverlayTypography.displayFont(reportedFont: context.font, caretHeight: caretRect.height)
+        logOverlayGeometryIfNeeded(context: context, caret: caret, font: font, suggestionLength: suggestion.count)
+        overlay.update(text: suggestion, font: font, caretRect: caretRect)
+    }
+
+    private func logOverlayGeometryIfNeeded(
+        context: FocusedTextContext,
+        caret: CaretGeometry,
+        font: NSFont,
+        suggestionLength: Int
+    ) {
+        guard context.appName == "TextEdit" else { return }
+
+        let caretRect = caret.screenRect
+        let lineHeight = font.ascender - font.descender + font.leading
+        let key = [
+            caretRect.origin.x.rounded(.toNearestOrAwayFromZero),
+            caretRect.origin.y.rounded(.toNearestOrAwayFromZero),
+            caretRect.height.rounded(.toNearestOrAwayFromZero),
+            font.pointSize.rounded(.toNearestOrAwayFromZero),
+            CGFloat(suggestionLength)
+        ].map { String(Int($0)) }.joined(separator: ":")
+
+        guard key != lastOverlayDiagnosticKey else { return }
+        lastOverlayDiagnosticKey = key
+
+        suggestionLogger.info(
+            "Overlay geometry app=\(context.appName, privacy: .public) source=\(caret.source, privacy: .public) caretX=\(caretRect.origin.x) caretY=\(caretRect.origin.y) caretHeight=\(caretRect.height) rawY=\(caret.rawRect.origin.y) convertedY=\(caret.convertedRect.origin.y) font=\(font.fontName, privacy: .public) fontSize=\(font.pointSize) lineHeight=\(lineHeight) suggestionLength=\(suggestionLength)"
+        )
     }
 
     private func updateOverlayPosition() {
@@ -361,6 +392,7 @@ private final class SuggestionController {
         activeSession = nil
         lastRequestedText = ""
         isGenerating = false
+        lastOverlayDiagnosticKey = nil
         overlay.hide()
     }
 }
@@ -369,9 +401,20 @@ private struct FocusedTextContext {
     let element: AXUIElement
     let value: String?
     let selectedRange: CFRange?
-    let caretRect: CGRect?
+    let caret: CaretGeometry?
     let font: NSFont?
     let appName: String
+
+    var caretRect: CGRect? {
+        caret?.screenRect
+    }
+}
+
+private struct CaretGeometry {
+    let rawRect: CGRect
+    let convertedRect: CGRect
+    let screenRect: CGRect
+    let source: String
 }
 
 private enum FocusedTextReader {
@@ -386,14 +429,14 @@ private enum FocusedTextReader {
         let value = readString(element, attribute: kAXValueAttribute as CFString)
         let range = readSelectedRange(element)
         let caret = range.flatMap { selection in
-            Self.caretRect(for: element, range: selection)
+            Self.caretGeometry(for: element, range: selection)
         }
         let font = readFont(element: element, value: value, range: range)
         return FocusedTextContext(
             element: element,
             value: value,
             selectedRange: range,
-            caretRect: caret,
+            caret: caret,
             font: font,
             appName: NSWorkspace.shared.frontmostApplication?.localizedName ?? "Unknown"
         )
@@ -497,19 +540,32 @@ private enum FocusedTextReader {
         return range
     }
 
-    private static func caretRect(for element: AXUIElement, range: CFRange) -> CGRect? {
+    private static func caretGeometry(for element: AXUIElement, range: CFRange) -> CaretGeometry? {
         var caretRange = CFRange(location: range.location, length: 0)
         if let rect = bounds(for: element, range: caretRange), rect.height > 2 {
-            return convertQuartzToAppKit(rect)
+            return geometry(from: rect)
         }
         if range.location > 0 {
             caretRange = CFRange(location: range.location - 1, length: 1)
             if let rect = bounds(for: element, range: caretRange), rect.height > 2 {
-                let converted = convertQuartzToAppKit(rect)
-                return CGRect(x: converted.maxX, y: converted.minY, width: 0, height: converted.height)
+                return geometry(from: CGRect(x: rect.maxX, y: rect.minY, width: 0, height: rect.height))
             }
         }
         return nil
+    }
+
+    private static func geometry(from rawRect: CGRect) -> CaretGeometry {
+        let convertedRect = convertQuartzToAppKit(rawRect)
+        let rawScreen = screen(containing: rawRect)
+        let convertedScreen = screen(containing: convertedRect)
+
+        if rawScreen != nil {
+            return CaretGeometry(rawRect: rawRect, convertedRect: convertedRect, screenRect: rawRect, source: "raw")
+        }
+        if convertedScreen != nil {
+            return CaretGeometry(rawRect: rawRect, convertedRect: convertedRect, screenRect: convertedRect, source: "converted")
+        }
+        return CaretGeometry(rawRect: rawRect, convertedRect: convertedRect, screenRect: rawRect, source: "raw-offscreen")
     }
 
     private static func bounds(for element: AXUIElement, range: CFRange) -> CGRect? {
@@ -582,6 +638,17 @@ private enum FocusedTextReader {
         }
         return rect
     }
+
+    private static func screen(containing rect: CGRect) -> NSScreen? {
+        let candidates = [
+            CGPoint(x: rect.midX, y: rect.midY),
+            CGPoint(x: rect.minX, y: rect.minY),
+            CGPoint(x: rect.maxX, y: rect.maxY)
+        ]
+        return NSScreen.screens.first { screen in
+            candidates.contains { screen.frame.insetBy(dx: -4, dy: -4).contains($0) }
+        }
+    }
 }
 
 private enum FocusedTextWriter {
@@ -604,6 +671,7 @@ private final class SuggestionOverlayWindow: NSPanel {
         hasShadow = false
         backgroundColor = .clear
         level = .popUpMenu
+        animationBehavior = .none
         ignoresMouseEvents = true
         collectionBehavior = [.moveToActiveSpace, .fullScreenAuxiliary, .ignoresCycle]
         contentView = textView
@@ -615,22 +683,23 @@ private final class SuggestionOverlayWindow: NSPanel {
             return
         }
 
+        let metrics = OverlayTypography.metrics(for: font, caretHeight: caretRect.height)
         let size = (text as NSString).size(withAttributes: [.font: font])
-        let lineHeight = ceil(font.ascender - font.descender + font.leading)
-        let height = ceil(max(caretRect.height, lineHeight, size.height))
+        let height = ceil(max(caretRect.height, metrics.lineHeight, size.height))
         var frame = CGRect(
             x: caretRect.maxX,
-            y: caretRect.midY - (height / 2),
+            y: caretRect.minY + ((caretRect.height - height) / 2),
             width: ceil(size.width) + 2,
             height: height
         )
 
-        if let visible = NSScreen.screens.first(where: { $0.frame.contains(caretRect.origin) })?.visibleFrame ?? NSScreen.main?.visibleFrame {
+        if let visible = NSScreen.screens.first(where: { $0.frame.contains(caretRect.center) })?.visibleFrame ?? NSScreen.main?.visibleFrame {
             if frame.maxX > visible.maxX { frame.origin.x = visible.maxX - frame.width }
             if frame.minX < visible.minX { frame.origin.x = visible.minX }
             if frame.maxY > visible.maxY { frame.origin.y = visible.maxY - frame.height }
             if frame.minY < visible.minY { frame.origin.y = visible.minY }
         }
+        frame = frame.roundedForStableOverlay()
 
         let sameText = textView.text == text
         let sameFont = textView.font.fontName == font.fontName && abs(textView.font.pointSize - font.pointSize) < 0.1
@@ -638,7 +707,7 @@ private final class SuggestionOverlayWindow: NSPanel {
             return
         }
 
-        textView.update(text: text, font: font)
+        textView.update(text: text, font: font, baselineOffset: metrics.baselineOffset)
         setFrame(frame, display: false)
         textView.frame = CGRect(origin: .zero, size: frame.size)
         textView.needsDisplay = true
@@ -657,12 +726,14 @@ private final class SuggestionOverlayWindow: NSPanel {
 private final class SuggestionOverlayView: NSView {
     private(set) var text = ""
     private(set) var font = NSFont.systemFont(ofSize: NSFont.systemFontSize)
+    private var baselineOffset: CGFloat = 0
 
     override var isFlipped: Bool { true }
 
-    func update(text: String, font: NSFont) {
+    func update(text: String, font: NSFont, baselineOffset: CGFloat) {
         self.text = text
         self.font = font
+        self.baselineOffset = baselineOffset
     }
 
     override func draw(_ dirtyRect: NSRect) {
@@ -673,9 +744,53 @@ private final class SuggestionOverlayView: NSView {
             .font: font,
             .foregroundColor: NSColor.tertiaryLabelColor
         ]
-        let size = (text as NSString).size(withAttributes: attributes)
-        let y = max(0, floor((bounds.height - size.height) / 2))
+        let y = max(0, floor((bounds.height - OverlayTypography.metrics(for: font, caretHeight: bounds.height).lineHeight) / 2 + baselineOffset))
         (text as NSString).draw(at: CGPoint(x: 0, y: y), withAttributes: attributes)
+    }
+}
+
+private enum OverlayTypography {
+    struct Metrics {
+        let lineHeight: CGFloat
+        let baselineOffset: CGFloat
+    }
+
+    static func displayFont(reportedFont: NSFont?, caretHeight: CGFloat) -> NSFont {
+        guard caretHeight.isFinite, caretHeight > 4 else {
+            return reportedFont ?? .systemFont(ofSize: NSFont.systemFontSize)
+        }
+
+        let fallbackSize = max(10, min(24, caretHeight * 0.72))
+        let baseFont = reportedFont ?? .systemFont(ofSize: fallbackSize)
+        let lineHeight = max(1, baseFont.ascender - baseFont.descender + baseFont.leading)
+        let targetSize = max(10, min(28, baseFont.pointSize * (caretHeight / lineHeight)))
+
+        guard abs(targetSize - baseFont.pointSize) > 1 else {
+            return baseFont
+        }
+
+        return NSFont(descriptor: baseFont.fontDescriptor, size: targetSize) ?? .systemFont(ofSize: targetSize)
+    }
+
+    static func metrics(for font: NSFont, caretHeight: CGFloat) -> Metrics {
+        let lineHeight = ceil(max(1, font.ascender - font.descender + font.leading))
+        let extraCaretSpace = max(0, caretHeight - lineHeight)
+        return Metrics(lineHeight: lineHeight, baselineOffset: floor(extraCaretSpace / 2))
+    }
+}
+
+private extension CGRect {
+    var center: CGPoint {
+        CGPoint(x: midX, y: midY)
+    }
+
+    func roundedForStableOverlay() -> CGRect {
+        CGRect(
+            x: origin.x.rounded(.toNearestOrAwayFromZero),
+            y: origin.y.rounded(.toNearestOrAwayFromZero),
+            width: width.rounded(.up),
+            height: height.rounded(.up)
+        )
     }
 }
 
