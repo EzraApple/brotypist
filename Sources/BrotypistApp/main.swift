@@ -3,6 +3,13 @@ import ApplicationServices
 import BrotypistCore
 import BrotypistRuntime
 import Carbon.HIToolbox
+import CoreText
+import OSLog
+
+private let appLogger = Logger(subsystem: "com.ezraapple.brotypist", category: "app")
+private let suggestionLogger = Logger(subsystem: "com.ezraapple.brotypist", category: "suggestion")
+private let focusLogger = Logger(subsystem: "com.ezraapple.brotypist", category: "focus")
+private let completionDebounceNanoseconds: UInt64 = 220_000_000
 
 @main
 @MainActor
@@ -21,6 +28,7 @@ final class BrotypistApp: NSObject, NSApplicationDelegate {
         NSApp.setActivationPolicy(.accessory)
 
         let modelURL = Self.defaultModelURL()
+        appLogger.info("Launching Brotypist modelPath=\(modelURL.path, privacy: .public)")
         let engine = LlamaCompletionEngine(modelURL: modelURL)
         let controller = SuggestionController(engine: engine)
         self.controller = controller
@@ -31,6 +39,7 @@ final class BrotypistApp: NSObject, NSApplicationDelegate {
         item.button?.title = " Brotypist"
         item.menu = makeMenu(controller: controller)
         statusItem = item
+        appLogger.info("Menu bar item installed")
     }
 
     private static func defaultModelURL() -> URL {
@@ -86,6 +95,8 @@ private final class SuggestionController {
     private var activeSession: SuggestionSession?
     private var lastRequestedText = ""
     private var isGenerating = false
+    private var lastAccessibilityTrusted: Bool?
+    private var lastEventTapAttempt: Date?
 
     init(engine: any TextCompletionEngine) {
         self.engine = engine
@@ -99,15 +110,23 @@ private final class SuggestionController {
                 self?.refreshFocusedText()
             }
         }
+        suggestionLogger.info("Suggestion controller started")
     }
 
     private func requestAccessibilityIfNeeded() {
         let options = ["AXTrustedCheckOptionPrompt": true] as CFDictionary
-        _ = AXIsProcessTrustedWithOptions(options)
+        let trusted = AXIsProcessTrustedWithOptions(options)
+        lastAccessibilityTrusted = trusted
+        appLogger.info("Accessibility trusted=\(trusted)")
     }
 
     private func startEventTap() {
         guard eventTap == nil else { return }
+        let now = Date()
+        if let lastEventTapAttempt, now.timeIntervalSince(lastEventTapAttempt) < 2 {
+            return
+        }
+        lastEventTapAttempt = now
 
         let mask = 1 << CGEventType.keyDown.rawValue
         let callback: CGEventTapCallBack = { _, type, event, userInfo in
@@ -124,6 +143,7 @@ private final class SuggestionController {
             callback: callback,
             userInfo: UnsafeMutableRawPointer(Unmanaged.passUnretained(self).toOpaque())
         ) else {
+            appLogger.error("Failed to create event tap; Input Monitoring may be missing")
             return
         }
 
@@ -132,6 +152,7 @@ private final class SuggestionController {
         if let eventTapSource {
             CFRunLoopAddSource(CFRunLoopGetMain(), eventTapSource, .commonModes)
             CGEvent.tapEnable(tap: tap, enable: true)
+            appLogger.info("Event tap installed")
         }
     }
 
@@ -140,10 +161,12 @@ private final class SuggestionController {
 
         let keycode = event.getIntegerValueField(.keyboardEventKeycode)
         if keycode == kVK_Tab, acceptSuggestion() {
+            suggestionLogger.info("Tab accepted suggestion")
             return nil
         }
 
         if keycode == kVK_Escape, activeSession != nil {
+            suggestionLogger.info("Escape dismissed suggestion")
             clearSuggestion()
             return nil
         }
@@ -161,7 +184,16 @@ private final class SuggestionController {
     }
 
     private func refreshFocusedText() {
-        guard AXIsProcessTrusted() else {
+        let trusted = AXIsProcessTrusted()
+        if lastAccessibilityTrusted != trusted {
+            appLogger.info("Accessibility trusted=\(trusted)")
+            lastAccessibilityTrusted = trusted
+        }
+        if eventTap == nil {
+            startEventTap()
+        }
+
+        guard trusted else {
             overlay.hide()
             return
         }
@@ -169,12 +201,23 @@ private final class SuggestionController {
         guard let context = FocusedTextReader.read() else {
             focusedContext = nil
             clearSuggestion()
+            focusLogger.debug("No focused editable context")
             return
         }
 
         focusedContext = context
         guard let value = context.value else {
             overlay.hide()
+            focusLogger.debug("Focused context has no readable value app=\(context.appName, privacy: .public)")
+            return
+        }
+
+        guard context.caretRect != nil else {
+            if value != currentText {
+                currentText = value
+                focusLogger.info("Focused text changed app=\(context.appName, privacy: .public) length=\(value.count) hasCaret=false")
+            }
+            clearSuggestion()
             return
         }
 
@@ -193,23 +236,31 @@ private final class SuggestionController {
         }
 
         currentText = value
+        focusLogger.info("Focused text changed app=\(context.appName, privacy: .public) length=\(value.count) hasCaret=\(context.caretRect != nil)")
         maybeGenerate(for: value, context: context)
     }
 
     private func maybeGenerate(for text: String, context: FocusedTextContext) {
         guard shouldTriggerCompletion(text) else {
             clearSuggestion()
+            suggestionLogger.debug("Generation skipped by trigger rules length=\(text.count)")
             return
         }
         guard text != lastRequestedText else { return }
 
         generationTask?.cancel()
         generationTask = Task { [weak self] in
-            try? await Task.sleep(nanoseconds: 130_000_000)
+            do {
+                try await Task.sleep(nanoseconds: completionDebounceNanoseconds)
+                try Task.checkCancellation()
+            } catch {
+                return
+            }
             guard let self else { return }
             await MainActor.run {
                 self.isGenerating = true
                 self.lastRequestedText = text
+                suggestionLogger.info("Generation started app=\(context.appName, privacy: .public) length=\(text.count)")
             }
 
             let request = SuggestionRequest(
@@ -225,14 +276,28 @@ private final class SuggestionController {
                 try Task.checkCancellation()
                 await MainActor.run {
                     self.isGenerating = false
-                    guard self.currentText == text, !suggestion.isEmpty else { return }
+                    guard self.currentText == text else {
+                        suggestionLogger.info("Generation discarded because text changed")
+                        return
+                    }
+                    guard !suggestion.isEmpty else {
+                        suggestionLogger.info("Generation returned empty suggestion")
+                        return
+                    }
                     self.activeSession = SuggestionSession(anchor: text, suggestion: suggestion)
+                    suggestionLogger.info("Generation ready suggestionLength=\(suggestion.count)")
                     self.showSuggestion(suggestion)
+                }
+            } catch is CancellationError {
+                await MainActor.run {
+                    self.isGenerating = false
+                    suggestionLogger.debug("Generation cancelled")
                 }
             } catch {
                 await MainActor.run {
                     self.isGenerating = false
                     self.overlay.hide()
+                    suggestionLogger.error("Generation failed error=\(error.localizedDescription, privacy: .public)")
                 }
             }
         }
@@ -261,9 +326,11 @@ private final class SuggestionController {
 
         if let context = focusedContext, FocusedTextWriter.insert(acceptance.accepted, into: context) {
             currentText += acceptance.accepted
+            suggestionLogger.info("Accepted via AX insertion length=\(acceptance.accepted.count)")
         } else {
             KeyboardTyper.type(acceptance.accepted)
             currentText += acceptance.accepted
+            suggestionLogger.info("Accepted via keyboard fallback length=\(acceptance.accepted.count)")
         }
 
         self.activeSession = acceptance.remaining
@@ -276,8 +343,12 @@ private final class SuggestionController {
     }
 
     private func showSuggestion(_ suggestion: String) {
-        guard let context = focusedContext, let caretRect = context.caretRect else { return }
-        overlay.update(text: suggestion, font: context.font ?? .systemFont(ofSize: 15), origin: CGPoint(x: caretRect.maxX, y: caretRect.minY))
+        guard let context = focusedContext, let caretRect = context.caretRect else {
+            suggestionLogger.debug("Could not show suggestion because caret rect is missing")
+            return
+        }
+        suggestionLogger.debug("Showing suggestion length=\(suggestion.count)")
+        overlay.update(text: suggestion, font: context.font ?? .systemFont(ofSize: NSFont.systemFontSize), caretRect: caretRect)
     }
 
     private func updateOverlayPosition() {
@@ -479,7 +550,18 @@ private enum FocusedTextReader {
               attributedString.length > 0 else {
             return nil
         }
-        return attributedString.attribute(.font, at: 0, effectiveRange: nil) as? NSFont
+        let fontAttribute = attributedString.attribute(.font, at: 0, effectiveRange: nil)
+        if let font = fontAttribute as? NSFont {
+            return font
+        }
+        if let fontAttribute {
+            let cfFont = fontAttribute as CFTypeRef
+            guard CFGetTypeID(cfFont) == CTFontGetTypeID() else { return nil }
+            let ctFont = unsafeBitCast(cfFont, to: CTFont.self)
+            let name = CTFontCopyPostScriptName(ctFont) as String
+            return NSFont(name: name, size: CTFontGetSize(ctFont))
+        }
+        return nil
     }
 
     private static func convertQuartzToAppKit(_ rect: CGRect) -> CGRect {
@@ -509,7 +591,7 @@ private enum FocusedTextWriter {
 }
 
 private final class SuggestionOverlayWindow: NSPanel {
-    private let label = NSTextField(labelWithString: "")
+    private let textView = SuggestionOverlayView()
 
     init() {
         super.init(
@@ -524,36 +606,76 @@ private final class SuggestionOverlayWindow: NSPanel {
         level = .popUpMenu
         ignoresMouseEvents = true
         collectionBehavior = [.moveToActiveSpace, .fullScreenAuxiliary, .ignoresCycle]
-        label.textColor = .systemGray
-        label.backgroundColor = .clear
-        label.isBordered = false
-        label.isEditable = false
-        label.isSelectable = false
-        contentView = label
+        contentView = textView
     }
 
-    func update(text: String, font: NSFont, origin: CGPoint) {
+    func update(text: String, font: NSFont, caretRect: CGRect) {
         guard !text.isEmpty else {
             hide()
             return
         }
-        label.stringValue = text
-        label.font = font
+
         let size = (text as NSString).size(withAttributes: [.font: font])
-        var frame = CGRect(x: origin.x, y: origin.y, width: ceil(size.width) + 2, height: ceil(size.height) + 2)
-        if let visible = NSScreen.screens.first(where: { $0.frame.contains(origin) })?.visibleFrame ?? NSScreen.main?.visibleFrame {
+        let lineHeight = ceil(font.ascender - font.descender + font.leading)
+        let height = ceil(max(caretRect.height, lineHeight, size.height))
+        var frame = CGRect(
+            x: caretRect.maxX,
+            y: caretRect.midY - (height / 2),
+            width: ceil(size.width) + 2,
+            height: height
+        )
+
+        if let visible = NSScreen.screens.first(where: { $0.frame.contains(caretRect.origin) })?.visibleFrame ?? NSScreen.main?.visibleFrame {
             if frame.maxX > visible.maxX { frame.origin.x = visible.maxX - frame.width }
             if frame.minX < visible.minX { frame.origin.x = visible.minX }
             if frame.maxY > visible.maxY { frame.origin.y = visible.maxY - frame.height }
             if frame.minY < visible.minY { frame.origin.y = visible.minY }
         }
+
+        let sameText = textView.text == text
+        let sameFont = textView.font.fontName == font.fontName && abs(textView.font.pointSize - font.pointSize) < 0.1
+        if isVisible, sameText, sameFont, self.frame.integral == frame.integral {
+            return
+        }
+
+        textView.update(text: text, font: font)
         setFrame(frame, display: false)
-        label.frame = CGRect(origin: .zero, size: frame.size)
-        orderFrontRegardless()
+        textView.frame = CGRect(origin: .zero, size: frame.size)
+        textView.needsDisplay = true
+        if isVisible {
+            displayIfNeeded()
+        } else {
+            orderFrontRegardless()
+        }
     }
 
     func hide() {
         orderOut(nil)
+    }
+}
+
+private final class SuggestionOverlayView: NSView {
+    private(set) var text = ""
+    private(set) var font = NSFont.systemFont(ofSize: NSFont.systemFontSize)
+
+    override var isFlipped: Bool { true }
+
+    func update(text: String, font: NSFont) {
+        self.text = text
+        self.font = font
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        guard !text.isEmpty else { return }
+
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: font,
+            .foregroundColor: NSColor.tertiaryLabelColor
+        ]
+        let size = (text as NSString).size(withAttributes: attributes)
+        let y = max(0, floor((bounds.height - size.height) / 2))
+        (text as NSString).draw(at: CGPoint(x: 0, y: y), withAttributes: attributes)
     }
 }
 

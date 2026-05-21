@@ -22,6 +22,7 @@ Brotypist is a macOS-local autocomplete app in MVP development. It runs as a men
 - [x] Model runtime integration.
 - [x] CLI model smoke test.
 - [x] Basic focused-field autocomplete flow.
+- [x] Stable local dev signing identity for repeatable macOS permission testing.
 - [ ] Manual compatibility pass across Safari, Notes, Mail, Slack, and TextEdit.
 - [ ] Runtime latency tuning and KV-cache reuse.
 
@@ -45,6 +46,12 @@ swift run brotypistctl Can you send
 
 # Launch the menu bar app from source
 swift run brotypist
+
+# Create a stable local signing identity for dev builds
+./scripts/create-dev-codesign-cert.sh
+
+# Stop repeated keychain prompts when signing dev builds
+./scripts/allow-dev-codesign-key.sh
 
 # Build a standalone dev app bundle
 ./scripts/build-dev-app.sh
@@ -84,6 +91,21 @@ The current MVP flow:
 6. Press `Tab` to accept the next word, or `Esc` to dismiss.
 
 The first implementation is intentionally small: no OCR, no settings pane, no bundled installer, and no prompt personalization yet.
+
+For local app testing, create the dev signing identity once before rebuilding:
+
+```sh
+./scripts/create-dev-codesign-cert.sh
+./scripts/build-dev-app.sh
+```
+
+The local certificate is named `Brotypist Local Development`. It keeps the app's macOS privacy identity stable across rebuilds; without it, ad-hoc signing can make Accessibility and Input Monitoring look enabled in Settings while the rebuilt app still gets denied.
+
+If `codesign` keeps asking for your login keychain password on every build, run this once from a normal terminal:
+
+```sh
+./scripts/allow-dev-codesign-key.sh
+```
 
 If macOS permissions get stuck while testing the dev bundle, reset them with:
 

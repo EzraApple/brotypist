@@ -11,6 +11,7 @@ MACOS_DIR="${CONTENTS_DIR}/MacOS"
 FRAMEWORKS_DIR="${CONTENTS_DIR}/Frameworks"
 RESOURCES_DIR="${CONTENTS_DIR}/Resources"
 MODEL_FILE="Qwen3-0.6B-Q4_K_M.gguf"
+DEFAULT_CODESIGN_IDENTITY="Brotypist Local Development"
 
 swift build --product brotypist -c "${CONFIGURATION}"
 BIN_DIR="$(swift build -c "${CONFIGURATION}" --show-bin-path)"
@@ -68,7 +69,16 @@ cat > "${CONTENTS_DIR}/Info.plist" <<PLIST
 </plist>
 PLIST
 
-codesign --force --deep --sign - "${APP_PATH}"
+if [[ -z "${CODESIGN_IDENTITY:-}" ]]; then
+  if security find-identity -v -p codesigning | grep -Fq "\"${DEFAULT_CODESIGN_IDENTITY}\""; then
+    CODESIGN_IDENTITY="${DEFAULT_CODESIGN_IDENTITY}"
+  else
+    CODESIGN_IDENTITY="-"
+  fi
+fi
+
+codesign --force --deep --sign "${CODESIGN_IDENTITY}" "${APP_PATH}"
 
 echo "Built ${APP_PATH}"
+echo "Signed with: ${CODESIGN_IDENTITY}"
 echo "Open with: open ${APP_PATH}"
