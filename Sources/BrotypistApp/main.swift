@@ -20,8 +20,7 @@ final class BrotypistApp: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
 
-        let modelURL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
-            .appendingPathComponent("Models/Qwen3-0.6B-Q4_K_M.gguf")
+        let modelURL = Self.defaultModelURL()
         let engine = LlamaCompletionEngine(modelURL: modelURL)
         let controller = SuggestionController(engine: engine)
         self.controller = controller
@@ -32,6 +31,18 @@ final class BrotypistApp: NSObject, NSApplicationDelegate {
         item.button?.title = " Brotypist"
         item.menu = makeMenu(controller: controller)
         statusItem = item
+    }
+
+    private static func defaultModelURL() -> URL {
+        let modelPath = "Models/Qwen3-0.6B-Q4_K_M.gguf"
+        if let resourceURL = Bundle.main.resourceURL {
+            let bundledModel = resourceURL.appendingPathComponent(modelPath)
+            if FileManager.default.fileExists(atPath: bundledModel.path) {
+                return bundledModel
+            }
+        }
+        return URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+            .appendingPathComponent(modelPath)
     }
 
     private func makeMenu(controller: SuggestionController) -> NSMenu {

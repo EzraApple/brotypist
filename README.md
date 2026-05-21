@@ -45,6 +45,15 @@ swift run brotypistctl Can you send
 
 # Launch the menu bar app from source
 swift run brotypist
+
+# Build a standalone dev app bundle
+./scripts/build-dev-app.sh
+
+# Verify the dev app bundle layout/signature
+./scripts/test-dev-app-bundle.sh
+
+# Launch the standalone dev app bundle
+open dist/Brotypist.app
 ```
 
 ## Model Setup
@@ -67,7 +76,7 @@ The script creates `Models/`, skips the download when the file already exists, a
 
 The current MVP flow:
 
-1. Launch Brotypist.
+1. Build and launch the dev app with `./scripts/build-dev-app.sh && open dist/Brotypist.app`.
 2. Grant Accessibility permission when macOS prompts. Input Monitoring may also be required for the global Tab event tap.
 3. Type in any supported text field.
 4. Brotypist generates after a short debounce once there is enough text to continue.
@@ -75,6 +84,13 @@ The current MVP flow:
 6. Press `Tab` to accept the next word, or `Esc` to dismiss.
 
 The first implementation is intentionally small: no OCR, no settings pane, no bundled installer, and no prompt personalization yet.
+
+If macOS permissions get stuck while testing the dev bundle, reset them with:
+
+```sh
+tccutil reset Accessibility com.ezraapple.brotypist
+tccutil reset ListenEvent com.ezraapple.brotypist
+```
 
 ## Next Planned Steps
 

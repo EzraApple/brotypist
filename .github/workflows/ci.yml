@@ -21,5 +21,11 @@ jobs:
       - name: Run CLI smoke test
         run: swift run brotypistctl --stub CI smoke
 
+      - name: Build dev app bundle
+        run: ./scripts/build-dev-app.sh
+
+      - name: Verify dev app bundle
+        run: ./scripts/test-dev-app-bundle.sh
+
       - name: Build
         run: swift build
