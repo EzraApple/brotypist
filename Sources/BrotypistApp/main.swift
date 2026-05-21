@@ -556,16 +556,15 @@ private enum FocusedTextReader {
 
     private static func geometry(from rawRect: CGRect) -> CaretGeometry {
         let convertedRect = convertQuartzToAppKit(rawRect)
-        let rawScreen = screen(containing: rawRect)
         let convertedScreen = screen(containing: convertedRect)
 
-        if rawScreen != nil {
-            return CaretGeometry(rawRect: rawRect, convertedRect: convertedRect, screenRect: rawRect, source: "raw")
-        }
         if convertedScreen != nil {
             return CaretGeometry(rawRect: rawRect, convertedRect: convertedRect, screenRect: convertedRect, source: "converted")
         }
-        return CaretGeometry(rawRect: rawRect, convertedRect: convertedRect, screenRect: rawRect, source: "raw-offscreen")
+        if screen(containing: rawRect) != nil {
+            return CaretGeometry(rawRect: rawRect, convertedRect: convertedRect, screenRect: rawRect, source: "raw-fallback")
+        }
+        return CaretGeometry(rawRect: rawRect, convertedRect: convertedRect, screenRect: convertedRect, source: "converted-offscreen")
     }
 
     private static func bounds(for element: AXUIElement, range: CFRange) -> CGRect? {
