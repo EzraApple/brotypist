@@ -1,0 +1,25 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  swift:
+    name: Swift
+    runs-on: macos-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Run tests
+        run: swift test
+
+      - name: Run CLI smoke test
+        run: swift run brotypistctl --stub CI smoke
+
+      - name: Build
+        run: swift build

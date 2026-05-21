@@ -1,0 +1,573 @@
+import AppKit
+import ApplicationServices
+import BrotypistCore
+import BrotypistRuntime
+import Carbon.HIToolbox
+
+@main
+@MainActor
+final class BrotypistApp: NSObject, NSApplicationDelegate {
+    private var statusItem: NSStatusItem?
+    private var controller: SuggestionController?
+
+    static func main() {
+        let app = NSApplication.shared
+        let delegate = BrotypistApp()
+        app.delegate = delegate
+        app.run()
+    }
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        NSApp.setActivationPolicy(.accessory)
+
+        let modelURL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+            .appendingPathComponent("Models/Qwen3-0.6B-Q4_K_M.gguf")
+        let engine = LlamaCompletionEngine(modelURL: modelURL)
+        let controller = SuggestionController(engine: engine)
+        self.controller = controller
+        controller.start()
+
+        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        item.button?.image = NSImage(systemSymbolName: "text.cursor", accessibilityDescription: "Brotypist")
+        item.button?.title = " Brotypist"
+        item.menu = makeMenu(controller: controller)
+        statusItem = item
+    }
+
+    private func makeMenu(controller: SuggestionController) -> NSMenu {
+        let menu = NSMenu()
+        menu.addItem(withTitle: "Brotypist running", action: nil, keyEquivalent: "")
+        menu.addItem(NSMenuItem.separator())
+        menu.addItem(
+            withTitle: "Open Accessibility Settings",
+            action: #selector(openAccessibilitySettings),
+            keyEquivalent: ""
+        ).target = self
+        menu.addItem(
+            withTitle: "Quit",
+            action: #selector(quit),
+            keyEquivalent: "q"
+        ).target = self
+        return menu
+    }
+
+    @objc private func openAccessibilitySettings() {
+        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
+            NSWorkspace.shared.open(url)
+        }
+    }
+
+    @objc private func quit() {
+        NSApp.terminate(nil)
+    }
+}
+
+@MainActor
+private final class SuggestionController {
+    private let engine: any TextCompletionEngine
+    private let overlay = SuggestionOverlayWindow()
+    private var eventTap: CFMachPort?
+    private var eventTapSource: CFRunLoopSource?
+    private var pollTimer: Timer?
+    private var generationTask: Task<Void, Never>?
+    private var focusedContext: FocusedTextContext?
+    private var currentText = ""
+    private var activeSession: SuggestionSession?
+    private var lastRequestedText = ""
+    private var isGenerating = false
+
+    init(engine: any TextCompletionEngine) {
+        self.engine = engine
+    }
+
+    func start() {
+        requestAccessibilityIfNeeded()
+        startEventTap()
+        pollTimer = Timer.scheduledTimer(withTimeInterval: 0.14, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.refreshFocusedText()
+            }
+        }
+    }
+
+    private func requestAccessibilityIfNeeded() {
+        let options = ["AXTrustedCheckOptionPrompt": true] as CFDictionary
+        _ = AXIsProcessTrustedWithOptions(options)
+    }
+
+    private func startEventTap() {
+        guard eventTap == nil else { return }
+
+        let mask = 1 << CGEventType.keyDown.rawValue
+        let callback: CGEventTapCallBack = { _, type, event, userInfo in
+            guard let userInfo else { return Unmanaged.passUnretained(event) }
+            let controller = Unmanaged<SuggestionController>.fromOpaque(userInfo).takeUnretainedValue()
+            return controller.handleEvent(type: type, event: event)
+        }
+
+        guard let tap = CGEvent.tapCreate(
+            tap: .cgSessionEventTap,
+            place: .headInsertEventTap,
+            options: .defaultTap,
+            eventsOfInterest: CGEventMask(mask),
+            callback: callback,
+            userInfo: UnsafeMutableRawPointer(Unmanaged.passUnretained(self).toOpaque())
+        ) else {
+            return
+        }
+
+        eventTap = tap
+        eventTapSource = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
+        if let eventTapSource {
+            CFRunLoopAddSource(CFRunLoopGetMain(), eventTapSource, .commonModes)
+            CGEvent.tapEnable(tap: tap, enable: true)
+        }
+    }
+
+    private func handleEvent(type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {
+        guard type == .keyDown else { return Unmanaged.passUnretained(event) }
+
+        let keycode = event.getIntegerValueField(.keyboardEventKeycode)
+        if keycode == kVK_Tab, acceptSuggestion() {
+            return nil
+        }
+
+        if keycode == kVK_Escape, activeSession != nil {
+            clearSuggestion()
+            return nil
+        }
+
+        if keycode == kVK_Delete {
+            clearSuggestion()
+        } else if event.unicodeString?.isEmpty == false {
+            generationTask?.cancel()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.02) { [weak self] in
+                self?.refreshFocusedText()
+            }
+        }
+
+        return Unmanaged.passUnretained(event)
+    }
+
+    private func refreshFocusedText() {
+        guard AXIsProcessTrusted() else {
+            overlay.hide()
+            return
+        }
+
+        guard let context = FocusedTextReader.read() else {
+            focusedContext = nil
+            clearSuggestion()
+            return
+        }
+
+        focusedContext = context
+        guard let value = context.value else {
+            overlay.hide()
+            return
+        }
+
+        if let activeSession {
+            if let reconciled = activeSession.reconcile(currentText: value) {
+                self.activeSession = reconciled
+                showSuggestion(reconciled.suggestion)
+            } else if value != currentText {
+                clearSuggestion()
+            }
+        }
+
+        guard value != currentText else {
+            updateOverlayPosition()
+            return
+        }
+
+        currentText = value
+        maybeGenerate(for: value, context: context)
+    }
+
+    private func maybeGenerate(for text: String, context: FocusedTextContext) {
+        guard shouldTriggerCompletion(text) else {
+            clearSuggestion()
+            return
+        }
+        guard text != lastRequestedText else { return }
+
+        generationTask?.cancel()
+        generationTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 130_000_000)
+            guard let self else { return }
+            await MainActor.run {
+                self.isGenerating = true
+                self.lastRequestedText = text
+            }
+
+            let request = SuggestionRequest(
+                prefix: currentLine(from: text),
+                appName: context.appName,
+                windowTitle: nil,
+                visualContext: nil,
+                maxPredictionWords: 6
+            )
+
+            do {
+                let suggestion = try await engine.complete(request: request)
+                try Task.checkCancellation()
+                await MainActor.run {
+                    self.isGenerating = false
+                    guard self.currentText == text, !suggestion.isEmpty else { return }
+                    self.activeSession = SuggestionSession(anchor: text, suggestion: suggestion)
+                    self.showSuggestion(suggestion)
+                }
+            } catch {
+                await MainActor.run {
+                    self.isGenerating = false
+                    self.overlay.hide()
+                }
+            }
+        }
+    }
+
+    private func shouldTriggerCompletion(_ text: String) -> Bool {
+        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return false }
+        if text.last?.isWhitespace == true { return true }
+
+        var currentWordLength = 0
+        for character in text.reversed() {
+            if character.isWhitespace { break }
+            currentWordLength += 1
+        }
+        return currentWordLength >= 2
+    }
+
+    private func currentLine(from text: String) -> String {
+        text.split(omittingEmptySubsequences: false, whereSeparator: \.isNewline).last.map(String.init) ?? text
+    }
+
+    private func acceptSuggestion() -> Bool {
+        guard let activeSession else { return false }
+        let acceptance = activeSession.acceptNextWord()
+        guard !acceptance.accepted.isEmpty else { return false }
+
+        if let context = focusedContext, FocusedTextWriter.insert(acceptance.accepted, into: context) {
+            currentText += acceptance.accepted
+        } else {
+            KeyboardTyper.type(acceptance.accepted)
+            currentText += acceptance.accepted
+        }
+
+        self.activeSession = acceptance.remaining
+        if let remaining = acceptance.remaining {
+            showSuggestion(remaining.suggestion)
+        } else {
+            overlay.hide()
+        }
+        return true
+    }
+
+    private func showSuggestion(_ suggestion: String) {
+        guard let context = focusedContext, let caretRect = context.caretRect else { return }
+        overlay.update(text: suggestion, font: context.font ?? .systemFont(ofSize: 15), origin: CGPoint(x: caretRect.maxX, y: caretRect.minY))
+    }
+
+    private func updateOverlayPosition() {
+        guard let suggestion = activeSession?.suggestion else { return }
+        showSuggestion(suggestion)
+    }
+
+    private func clearSuggestion() {
+        generationTask?.cancel()
+        activeSession = nil
+        lastRequestedText = ""
+        isGenerating = false
+        overlay.hide()
+    }
+}
+
+private struct FocusedTextContext {
+    let element: AXUIElement
+    let value: String?
+    let selectedRange: CFRange?
+    let caretRect: CGRect?
+    let font: NSFont?
+    let appName: String
+}
+
+private enum FocusedTextReader {
+    static func read() -> FocusedTextContext? {
+        let systemWide = AXUIElementCreateSystemWide()
+        guard let focused = copyElement(systemWide, attribute: kAXFocusedUIElementAttribute as CFString)
+            ?? focusedElementFromApplication(systemWide) else {
+            return nil
+        }
+
+        let element = resolveEditableElement(from: focused) ?? focused
+        let value = readString(element, attribute: kAXValueAttribute as CFString)
+        let range = readSelectedRange(element)
+        let caret = range.flatMap { selection in
+            Self.caretRect(for: element, range: selection)
+        }
+        let font = readFont(element: element, value: value, range: range)
+        return FocusedTextContext(
+            element: element,
+            value: value,
+            selectedRange: range,
+            caretRect: caret,
+            font: font,
+            appName: NSWorkspace.shared.frontmostApplication?.localizedName ?? "Unknown"
+        )
+    }
+
+    private static func focusedElementFromApplication(_ systemWide: AXUIElement) -> AXUIElement? {
+        guard let app = copyElement(systemWide, attribute: kAXFocusedApplicationAttribute as CFString) else {
+            return nil
+        }
+        return copyElement(app, attribute: kAXFocusedUIElementAttribute as CFString)
+    }
+
+    private static func resolveEditableElement(from root: AXUIElement) -> AXUIElement? {
+        if isEditable(root) { return root }
+        var queue: [(AXUIElement, Int)] = [(root, 0)]
+        var index = 0
+        while index < queue.count, index < 300 {
+            let (element, depth) = queue[index]
+            index += 1
+            if isEditable(element) { return element }
+            guard depth < 5 else { continue }
+            for child in children(of: element) {
+                queue.append((child, depth + 1))
+            }
+        }
+        return nil
+    }
+
+    private static func isEditable(_ element: AXUIElement) -> Bool {
+        let role = readString(element, attribute: kAXRoleAttribute as CFString)
+        if role == "AXSecureTextField" { return false }
+        let editable = readBool(element, attribute: "AXEditable" as CFString) ?? false
+        let textRoles: Set<String> = [
+            kAXTextFieldRole as String,
+            kAXTextAreaRole as String,
+            "AXSearchField",
+            "AXComboBox",
+            "AXWebArea"
+        ]
+        return editable || role.map { textRoles.contains($0) } == true
+    }
+
+    private static func children(of element: AXUIElement) -> [AXUIElement] {
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, kAXChildrenAttribute as CFString, &value) == .success,
+              let value else {
+            return []
+        }
+        if CFGetTypeID(value) == AXUIElementGetTypeID() {
+            return [unsafeBitCast(value, to: AXUIElement.self)]
+        }
+        guard CFGetTypeID(value) == CFArrayGetTypeID() else { return [] }
+        let array = value as! CFArray
+        return (0 ..< CFArrayGetCount(array)).compactMap { index in
+            let raw = CFArrayGetValueAtIndex(array, index)
+            let ref = unsafeBitCast(raw, to: CFTypeRef.self)
+            guard CFGetTypeID(ref) == AXUIElementGetTypeID() else { return nil }
+            return unsafeBitCast(ref, to: AXUIElement.self)
+        }
+    }
+
+    private static func copyElement(_ element: AXUIElement, attribute: CFString) -> AXUIElement? {
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, attribute, &value) == .success,
+              let value,
+              CFGetTypeID(value) == AXUIElementGetTypeID() else {
+            return nil
+        }
+        return unsafeBitCast(value, to: AXUIElement.self)
+    }
+
+    private static func readString(_ element: AXUIElement, attribute: CFString) -> String? {
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, attribute, &value) == .success,
+              let value else {
+            return nil
+        }
+        if let string = value as? String { return string }
+        if let attributed = value as? NSAttributedString { return attributed.string }
+        return nil
+    }
+
+    private static func readBool(_ element: AXUIElement, attribute: CFString) -> Bool? {
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, attribute, &value) == .success,
+              let number = value as? NSNumber else {
+            return nil
+        }
+        return number.boolValue
+    }
+
+    private static func readSelectedRange(_ element: AXUIElement) -> CFRange? {
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, kAXSelectedTextRangeAttribute as CFString, &value) == .success,
+              let value,
+              CFGetTypeID(value) == AXValueGetTypeID() else {
+            return nil
+        }
+        var range = CFRange()
+        guard AXValueGetValue(value as! AXValue, .cfRange, &range) else { return nil }
+        return range
+    }
+
+    private static func caretRect(for element: AXUIElement, range: CFRange) -> CGRect? {
+        var caretRange = CFRange(location: range.location, length: 0)
+        if let rect = bounds(for: element, range: caretRange), rect.height > 2 {
+            return convertQuartzToAppKit(rect)
+        }
+        if range.location > 0 {
+            caretRange = CFRange(location: range.location - 1, length: 1)
+            if let rect = bounds(for: element, range: caretRange), rect.height > 2 {
+                let converted = convertQuartzToAppKit(rect)
+                return CGRect(x: converted.maxX, y: converted.minY, width: 0, height: converted.height)
+            }
+        }
+        return nil
+    }
+
+    private static func bounds(for element: AXUIElement, range: CFRange) -> CGRect? {
+        var mutableRange = range
+        guard let rangeValue = AXValueCreate(.cfRange, &mutableRange) else { return nil }
+        var value: CFTypeRef?
+        guard AXUIElementCopyParameterizedAttributeValue(
+            element,
+            kAXBoundsForRangeParameterizedAttribute as CFString,
+            rangeValue,
+            &value
+        ) == .success,
+              let value,
+              CFGetTypeID(value) == AXValueGetTypeID() else {
+            return nil
+        }
+        var rect = CGRect.zero
+        guard AXValueGetValue(value as! AXValue, .cgRect, &rect) else { return nil }
+        return rect
+    }
+
+    private static func readFont(element: AXUIElement, value: String?, range: CFRange?) -> NSFont? {
+        guard let value, var range else { return nil }
+        if range.length == 0 {
+            let length = (value as NSString).length
+            guard length > 0 else { return nil }
+            range = CFRange(location: min(max(0, range.location), length - 1), length: 1)
+        }
+        guard let rangeValue = AXValueCreate(.cfRange, &range) else { return nil }
+        var attributed: CFTypeRef?
+        guard AXUIElementCopyParameterizedAttributeValue(
+            element,
+            kAXAttributedStringForRangeParameterizedAttribute as CFString,
+            rangeValue,
+            &attributed
+        ) == .success,
+              let attributedString = attributed as? NSAttributedString,
+              attributedString.length > 0 else {
+            return nil
+        }
+        return attributedString.attribute(.font, at: 0, effectiveRange: nil) as? NSFont
+    }
+
+    private static func convertQuartzToAppKit(_ rect: CGRect) -> CGRect {
+        let center = CGPoint(x: rect.midX, y: rect.midY)
+        for screen in NSScreen.screens {
+            guard let displayID = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID else {
+                continue
+            }
+            let displayBounds = CGDisplayBounds(displayID)
+            if displayBounds.contains(center) {
+                return CGRect(
+                    x: rect.origin.x - displayBounds.origin.x + screen.frame.origin.x,
+                    y: (displayBounds.origin.y + displayBounds.height) - (rect.origin.y + rect.height) + screen.frame.origin.y,
+                    width: rect.width,
+                    height: rect.height
+                )
+            }
+        }
+        return rect
+    }
+}
+
+private enum FocusedTextWriter {
+    static func insert(_ text: String, into context: FocusedTextContext) -> Bool {
+        AXUIElementSetAttributeValue(context.element, kAXSelectedTextAttribute as CFString, text as CFString) == .success
+    }
+}
+
+private final class SuggestionOverlayWindow: NSPanel {
+    private let label = NSTextField(labelWithString: "")
+
+    init() {
+        super.init(
+            contentRect: .zero,
+            styleMask: [.borderless, .nonactivatingPanel],
+            backing: .buffered,
+            defer: false
+        )
+        isOpaque = false
+        hasShadow = false
+        backgroundColor = .clear
+        level = .popUpMenu
+        ignoresMouseEvents = true
+        collectionBehavior = [.moveToActiveSpace, .fullScreenAuxiliary, .ignoresCycle]
+        label.textColor = .systemGray
+        label.backgroundColor = .clear
+        label.isBordered = false
+        label.isEditable = false
+        label.isSelectable = false
+        contentView = label
+    }
+
+    func update(text: String, font: NSFont, origin: CGPoint) {
+        guard !text.isEmpty else {
+            hide()
+            return
+        }
+        label.stringValue = text
+        label.font = font
+        let size = (text as NSString).size(withAttributes: [.font: font])
+        var frame = CGRect(x: origin.x, y: origin.y, width: ceil(size.width) + 2, height: ceil(size.height) + 2)
+        if let visible = NSScreen.screens.first(where: { $0.frame.contains(origin) })?.visibleFrame ?? NSScreen.main?.visibleFrame {
+            if frame.maxX > visible.maxX { frame.origin.x = visible.maxX - frame.width }
+            if frame.minX < visible.minX { frame.origin.x = visible.minX }
+            if frame.maxY > visible.maxY { frame.origin.y = visible.maxY - frame.height }
+            if frame.minY < visible.minY { frame.origin.y = visible.minY }
+        }
+        setFrame(frame, display: false)
+        label.frame = CGRect(origin: .zero, size: frame.size)
+        orderFrontRegardless()
+    }
+
+    func hide() {
+        orderOut(nil)
+    }
+}
+
+private enum KeyboardTyper {
+    static func type(_ text: String) {
+        guard let source = CGEventSource(stateID: .combinedSessionState) else { return }
+        for scalar in text.unicodeScalars {
+            var value = UniChar(scalar.value)
+            let down = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: true)
+            down?.keyboardSetUnicodeString(stringLength: 1, unicodeString: &value)
+            down?.post(tap: .cghidEventTap)
+
+            let up = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: false)
+            up?.keyboardSetUnicodeString(stringLength: 1, unicodeString: &value)
+            up?.post(tap: .cghidEventTap)
+        }
+    }
+}
+
+private extension CGEvent {
+    var unicodeString: String? {
+        var length = 0
+        var buffer = [UniChar](repeating: 0, count: 16)
+        keyboardGetUnicodeString(maxStringLength: 16, actualStringLength: &length, unicodeString: &buffer)
+        guard length > 0 else { return nil }
+        return String(utf16CodeUnits: buffer, count: length)
+    }
+}
