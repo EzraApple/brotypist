@@ -232,6 +232,15 @@ echo "Built ${APP_PATH}"
 echo "Signed with: ${CODESIGN_IDENTITY}"
 
 if [[ "${INSTALL_INPUT_METHOD:-0}" == "1" ]]; then
+  if [[ "${BROTYPIST_ALLOW_UNSAFE_INPUT_METHOD_INSTALL:-0}" != "1" ]]; then
+    echo
+    echo "Refusing to install: this package currently hangs the Keyboard Settings '+' picker on macOS 26.3.1."
+    echo "Build output is still available at ${APP_PATH} for inspection."
+    echo "To reproduce the unsafe registration probe anyway:"
+    echo "  BROTYPIST_ALLOW_UNSAFE_INPUT_METHOD_INSTALL=1 INSTALL_INPUT_METHOD=1 ./scripts/build-dev-im.sh"
+    exit 2
+  fi
+
   mkdir -p "${INSTALL_DIR}"
   rm -rf "${INSTALL_PATH}"
   ditto "${APP_PATH}" "${INSTALL_PATH}"
@@ -248,5 +257,5 @@ if [[ "${INSTALL_INPUT_METHOD:-0}" == "1" ]]; then
 else
   echo
   echo "Not installed. The IMK registration path is still experimental."
-  echo "To install explicitly: INSTALL_INPUT_METHOD=1 ./scripts/build-dev-im.sh"
+  echo "Unsafe install is gated behind BROTYPIST_ALLOW_UNSAFE_INPUT_METHOD_INSTALL=1."
 fi
