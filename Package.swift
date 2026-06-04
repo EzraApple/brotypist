@@ -11,6 +11,7 @@ let package = Package(
         .library(name: "BrotypistCore", targets: ["BrotypistCore"]),
         .executable(name: "brotypist", targets: ["BrotypistApp"]),
         .executable(name: "brotypistim", targets: ["BrotypistInputMethod"]),
+        .executable(name: "brotypistimext", targets: ["BrotypistInputMethodExtension"]),
         .executable(name: "brotypistctl", targets: ["BrotypistCLI"])
     ],
     dependencies: [
@@ -31,7 +32,15 @@ let package = Package(
         ),
         .executableTarget(
             name: "BrotypistInputMethod",
+            dependencies: ["BrotypistInputMethodSupport"]
+        ),
+        .target(
+            name: "BrotypistInputMethodSupport",
             dependencies: ["BrotypistCore", "BrotypistRuntime"]
+        ),
+        .executableTarget(
+            name: "BrotypistInputMethodExtension",
+            dependencies: ["BrotypistInputMethodSupport"]
         ),
         .executableTarget(
             name: "BrotypistCLI",

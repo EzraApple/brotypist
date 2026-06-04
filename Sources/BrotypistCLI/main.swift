@@ -143,7 +143,7 @@ func runInstallInputSource(args: [String]) {
         ?? "\(NSHomeDirectory())/Library/Input Methods/BrotypistInputMethod.app"
     let timeout = doubleFlag("--timeout", args: args) ?? 3.0
     let shouldSelect = !args.contains("--no-select")
-    let openSettingsOnFailure = !args.contains("--no-open-settings")
+    let openSettingsOnFailure = args.contains("--open-settings") && !args.contains("--no-open-settings")
 
     let bundleURL = URL(fileURLWithPath: bundlePath)
     guard FileManager.default.fileExists(atPath: bundlePath) else {
@@ -174,7 +174,7 @@ func runInstallInputSource(args: [String]) {
     guard let source else {
         print("Brotypist is not visible to the TIS input-source list yet.")
         print("The dev install now registers the PlugInKit extension and restarts the text-input agents.")
-        print("If it still does not appear, check System Settings → Keyboard → Input Sources → '+' for Brotypist.")
+        print("If it still does not appear, open System Settings from the normal UI and check Keyboard → Input Sources → '+'.")
         if openSettingsOnFailure {
             if let settingsURL = URL(string: "x-apple.systempreferences:com.apple.Keyboard-Settings.extension?InputSources") {
                 NSWorkspace.shared.open(settingsURL)

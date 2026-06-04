@@ -13,6 +13,7 @@ final class InputController: IMKInputController {
         let appName = Self.frontmostAppName()
         icLogger.debug("activate app=\(appName, privacy: .public)")
         MainActor.assumeIsolated {
+            InputMethodRuntime.configureSuggestionDriver()
             SuggestionDriver.shared.activate(client: client, appName: appName)
         }
     }

@@ -4,11 +4,13 @@ set -euo pipefail
 CONFIGURATION="${CONFIGURATION:-debug}"
 APP_NAME="BrotypistInputMethod"
 EXECUTABLE_NAME="brotypistim"
+EXTENSION_EXECUTABLE_NAME="brotypistimext"
 CONTAINER_BUNDLE_ID="com.ezraapple.BrotypistInputMethod"
 BUNDLE_ID="com.ezraapple.inputmethod.Brotypist"
 MODE_ID="${BUNDLE_ID}.Roman"
 CONNECTION_NAME="${BUNDLE_ID}.IMK_Connection"
 EXTENSION_NAME="${APP_NAME}Extension"
+EXTENSION_EXECUTABLE_FILE="${EXTENSION_NAME}"
 INSTALL_DIR="${HOME}/Library/Input Methods"
 INSTALL_PATH="${INSTALL_DIR}/${APP_NAME}.app"
 DIST_DIR="${DIST_DIR:-dist}"
@@ -27,6 +29,7 @@ MODEL_FILE="qwen3-0.6b-base-q4_k_m.gguf"
 DEFAULT_CODESIGN_IDENTITY="Brotypist Local Development"
 
 swift build --product "${EXECUTABLE_NAME}" -c "${CONFIGURATION}"
+swift build --product "${EXTENSION_EXECUTABLE_NAME}" -c "${CONFIGURATION}"
 BIN_DIR="$(swift build -c "${CONFIGURATION}" --show-bin-path)"
 
 rm -rf "${APP_PATH}"
@@ -39,8 +42,8 @@ mkdir -p \
   "${EXTENSION_RESOURCES_DIR}"
 
 cp "${BIN_DIR}/${EXECUTABLE_NAME}" "${APP_MACOS_DIR}/${APP_NAME}"
-cp "${BIN_DIR}/${EXECUTABLE_NAME}" "${EXTENSION_MACOS_DIR}/${APP_NAME}"
-chmod +x "${APP_MACOS_DIR}/${APP_NAME}" "${EXTENSION_MACOS_DIR}/${APP_NAME}"
+cp "${BIN_DIR}/${EXTENSION_EXECUTABLE_NAME}" "${EXTENSION_MACOS_DIR}/${EXTENSION_EXECUTABLE_FILE}"
+chmod +x "${APP_MACOS_DIR}/${APP_NAME}" "${EXTENSION_MACOS_DIR}/${EXTENSION_EXECUTABLE_FILE}"
 
 if [[ -d "${BIN_DIR}/llama.framework" ]]; then
   ditto "${BIN_DIR}/llama.framework" "${APP_FRAMEWORKS_DIR}/llama.framework"
@@ -50,7 +53,7 @@ else
   exit 1
 fi
 
-for executable in "${APP_MACOS_DIR}/${APP_NAME}" "${EXTENSION_MACOS_DIR}/${APP_NAME}"; do
+for executable in "${APP_MACOS_DIR}/${APP_NAME}" "${EXTENSION_MACOS_DIR}/${EXTENSION_EXECUTABLE_FILE}"; do
   if ! otool -l "${executable}" | grep -q '@executable_path/../Frameworks'; then
     install_name_tool -add_rpath '@executable_path/../Frameworks' "${executable}"
   fi
@@ -106,7 +109,7 @@ cat > "${EXTENSION_CONTENTS_DIR}/Info.plist" <<PLIST
   <key>CFBundleDevelopmentRegion</key>
   <string>en</string>
   <key>CFBundleExecutable</key>
-  <string>${APP_NAME}</string>
+  <string>${EXTENSION_EXECUTABLE_FILE}</string>
   <key>CFBundleDisplayName</key>
   <string>Brotypist</string>
   <key>CFBundleIdentifier</key>
