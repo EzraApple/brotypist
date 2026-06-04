@@ -5,6 +5,7 @@ import OSLog
 
 private let icLogger = Logger(subsystem: "com.ezraapple.brotypist.inputmethod", category: "controller")
 
+@objc(InputController)
 final class InputController: IMKInputController {
     override func activateServer(_ sender: Any!) {
         super.activateServer(sender)

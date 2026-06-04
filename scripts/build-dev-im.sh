@@ -4,10 +4,13 @@ set -euo pipefail
 CONFIGURATION="${CONFIGURATION:-debug}"
 APP_NAME="BrotypistInputMethod"
 EXECUTABLE_NAME="brotypistim"
-BUNDLE_ID="com.ezraapple.brotypist.inputmethod"
-CONNECTION_NAME="BrotypistInputMethod_Connection"
+BUNDLE_ID="com.ezraapple.inputmethod.Brotypist"
+MODE_ID="${BUNDLE_ID}.Roman"
+CONNECTION_NAME="${BUNDLE_ID}.IMK_Connection"
 INSTALL_DIR="${HOME}/Library/Input Methods"
-APP_PATH="${INSTALL_DIR}/${APP_NAME}.app"
+INSTALL_PATH="${INSTALL_DIR}/${APP_NAME}.app"
+DIST_DIR="${DIST_DIR:-dist}"
+APP_PATH="${DIST_DIR}/${APP_NAME}.app"
 CONTENTS_DIR="${APP_PATH}/Contents"
 MACOS_DIR="${CONTENTS_DIR}/MacOS"
 FRAMEWORKS_DIR="${CONTENTS_DIR}/Frameworks"
@@ -18,7 +21,6 @@ DEFAULT_CODESIGN_IDENTITY="Brotypist Local Development"
 swift build --product "${EXECUTABLE_NAME}" -c "${CONFIGURATION}"
 BIN_DIR="$(swift build -c "${CONFIGURATION}" --show-bin-path)"
 
-mkdir -p "${INSTALL_DIR}"
 rm -rf "${APP_PATH}"
 mkdir -p "${MACOS_DIR}" "${FRAMEWORKS_DIR}" "${RESOURCES_DIR}"
 
@@ -52,14 +54,22 @@ cat > "${CONTENTS_DIR}/Info.plist" <<PLIST
   <string>en</string>
   <key>CFBundleExecutable</key>
   <string>${APP_NAME}</string>
+  <key>CFBundleDisplayName</key>
+  <string>Brotypist</string>
   <key>CFBundleIdentifier</key>
   <string>${BUNDLE_ID}</string>
   <key>CFBundleInfoDictionaryVersion</key>
   <string>6.0</string>
   <key>CFBundleName</key>
-  <string>${APP_NAME}</string>
+  <string>Brotypist</string>
   <key>CFBundlePackageType</key>
   <string>APPL</string>
+  <key>CFBundleSignature</key>
+  <string>????</string>
+  <key>CFBundleSupportedPlatforms</key>
+  <array>
+    <string>MacOSX</string>
+  </array>
   <key>CFBundleShortVersionString</key>
   <string>0.1.0</string>
   <key>CFBundleVersion</key>
@@ -68,48 +78,57 @@ cat > "${CONTENTS_DIR}/Info.plist" <<PLIST
   <string>14.0</string>
   <key>LSUIElement</key>
   <true/>
+  <key>NSPrincipalClass</key>
+  <string>NSApplication</string>
+  <key>NSSupportsSuddenTermination</key>
+  <true/>
   <key>InputMethodConnectionName</key>
   <string>${CONNECTION_NAME}</string>
   <key>InputMethodServerControllerClass</key>
-  <string>BrotypistInputMethod.InputController</string>
+  <string>InputController</string>
+  <key>TISInputSourceID</key>
+  <string>${BUNDLE_ID}</string>
+  <key>TISIntendedLanguage</key>
+  <string>en</string>
   <key>tsInputMethodCharacterRepertoireKey</key>
   <array>
-    <string>en</string>
+    <string>Latn</string>
   </array>
+  <key>TISIconIsTemplate</key>
+  <true/>
   <key>ComponentInputModeDict</key>
   <dict>
     <key>tsInputModeListKey</key>
     <dict>
-      <key>com.ezraapple.brotypist.inputmethod.default</key>
+      <key>${MODE_ID}</key>
       <dict>
+        <key>TISIconLabels</key>
+        <dict>
+          <key>Primary</key>
+          <string>B</string>
+        </dict>
         <key>TISInputSourceID</key>
-        <string>com.ezraapple.brotypist.inputmethod.default</string>
+        <string>${MODE_ID}</string>
         <key>TISIntendedLanguage</key>
         <string>en</string>
-        <key>tsInputModeAlternateMenuIconFileKey</key>
-        <string></string>
         <key>tsInputModeCharacterRepertoireKey</key>
         <array>
-          <string>en</string>
+          <string>Latn</string>
         </array>
         <key>tsInputModeDefaultStateKey</key>
-        <string>on</string>
+        <true/>
         <key>tsInputModeIsVisibleKey</key>
         <true/>
-        <key>tsInputModeKeyEquivalentKey</key>
-        <string></string>
-        <key>tsInputModeKeyEquivalentModifiersKey</key>
-        <integer>0</integer>
-        <key>tsInputModeMenuIconFileKey</key>
-        <string></string>
-        <key>tsInputModePaletteIconFileKey</key>
-        <string></string>
         <key>tsInputModePrimaryInScriptKey</key>
         <true/>
         <key>tsInputModeScriptKey</key>
         <string>smRoman</string>
       </dict>
     </dict>
+    <key>tsVisibleInputModeOrderedArrayKey</key>
+    <array>
+      <string>${MODE_ID}</string>
+    </array>
   </dict>
 </dict>
 </plist>
@@ -127,9 +146,17 @@ codesign --force --deep --sign "${CODESIGN_IDENTITY}" "${APP_PATH}"
 
 echo "Built ${APP_PATH}"
 echo "Signed with: ${CODESIGN_IDENTITY}"
-echo
-echo "Activating input source..."
-swift run brotypistctl install-input-source 2>&1 | sed 's/^/  /' || true
-echo
-echo "If you don't see ghost text after this, switch to '${APP_NAME}'"
-echo "from the input-source menu in your menu bar (top right)."
+
+if [[ "${INSTALL_INPUT_METHOD:-0}" == "1" ]]; then
+  mkdir -p "${INSTALL_DIR}"
+  rm -rf "${INSTALL_PATH}"
+  ditto "${APP_PATH}" "${INSTALL_PATH}"
+  echo "Installed ${INSTALL_PATH}"
+  echo
+  echo "Registering input source..."
+  swift run brotypistctl install-input-source --bundle-id "${BUNDLE_ID}" --mode-id "${MODE_ID}" --bundle-path "${INSTALL_PATH}" --no-open-settings 2>&1 | sed 's/^/  /' || true
+else
+  echo
+  echo "Not installed. The IMK registration path is still experimental."
+  echo "To install explicitly: INSTALL_INPUT_METHOD=1 ./scripts/build-dev-im.sh"
+fi

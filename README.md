@@ -43,28 +43,29 @@ Fresh clone path:
 #    password on every rebuild. Run from an interactive terminal.
 ./scripts/allow-dev-codesign-key.sh
 
-# 4. Build and install the Input Method bundle.
+# 4. Build the Input Method bundle under dist/.
 ./scripts/build-dev-im.sh
 
-# 5. Add BrotypistInputMethod once in System Settings -> Keyboard -> Input Sources.
+# 5. Optional experimental registration:
+# INSTALL_INPUT_METHOD=1 ./scripts/build-dev-im.sh
 ```
 
-The install script tries to register and select the input source automatically. On first install, macOS may still require the manual System Settings add step; after that, rebuilds can usually activate the input source directly.
+The IMK registration path is still under investigation. The default build does not install into `~/Library/Input Methods` or open System Settings.
 
 ## Daily Dev Loop
 
-Iterate cycle for a rebuild + reinstall:
+Iterate cycle for a rebuild:
 
 ```sh
-# Rebuild, reinstall, register, and attempt to select the IMK input source.
+# Rebuild the IMK input method bundle under dist/.
 ./scripts/build-dev-im.sh
 ```
 
-The `Brotypist Local Development` identity keeps the input method's code identity stable across rebuilds. If the input source registry gets stuck, remove and rebuild it:
+The `Brotypist Local Development` identity keeps the bundle's code identity stable across rebuilds. If the input source registry gets stuck while testing explicit installation, remove the installed copy and restart the text-input agents:
 
 ```sh
 ./scripts/uninstall-dev-im.sh
-./scripts/build-dev-im.sh
+killall TextInputMenuAgent TextInputSwitcher imklaunchagent 2>/dev/null
 ```
 
 For logic-only iteration that skips the input method bundle:
@@ -104,10 +105,13 @@ swift run brotypist
 # Stop repeated keychain prompts when signing dev builds
 ./scripts/allow-dev-codesign-key.sh
 
-# Build the IMK bundle and install it to ~/Library/Input Methods/
+# Build the IMK bundle under dist/ without installing it
 ./scripts/build-dev-im.sh
 
-# Remove the IMK bundle (run this between rebuilds if the input source gets stuck)
+# Experimental: install the IMK bundle to ~/Library/Input Methods/
+INSTALL_INPUT_METHOD=1 ./scripts/build-dev-im.sh
+
+# Remove the installed IMK bundle
 ./scripts/uninstall-dev-im.sh
 
 # Build the legacy menu-bar dev bundle (deprecated)
@@ -116,7 +120,15 @@ swift run brotypist
 
 ## Enabling the Input Method
 
-After `./scripts/build-dev-im.sh` succeeds:
+The IMK registration flow is currently experimental. `./scripts/build-dev-im.sh` only builds `dist/BrotypistInputMethod.app` by default; it does not install into `~/Library/Input Methods`.
+
+To test registration explicitly:
+
+```sh
+INSTALL_INPUT_METHOD=1 ./scripts/build-dev-im.sh
+```
+
+If registration succeeds:
 
 1. Open **System Settings → Keyboard → Input Sources → "+"**.
 2. Pick **English** in the left list, then **BrotypistInputMethod** on the right, and click **Add**.
@@ -133,10 +145,10 @@ If the input source acts up after a rebuild:
 
 ```sh
 ./scripts/uninstall-dev-im.sh
-./scripts/build-dev-im.sh
+killall TextInputMenuAgent TextInputSwitcher imklaunchagent 2>/dev/null
 ```
 
-If it remains stuck in System Settings, remove it via **Keyboard → Input Sources → select → "-"**, then log out / log back in so the registry rescans.
+If System Settings hangs while opening the input-source picker, remove the installed bundle with `./scripts/uninstall-dev-im.sh`, quit System Settings, and restart the text-input agents with the `killall` command above. Do not rely on rebooting as the normal dev loop.
 
 ## Model Setup
 
@@ -161,7 +173,7 @@ The script creates `Models/`, skips the download when the file already exists, a
 The current MVP flow (IMK):
 
 1. Build the IM bundle with `./scripts/build-dev-im.sh`.
-2. Enable **BrotypistInputMethod** in System Settings → Keyboard → Input Sources (see [Enabling the Input Method](#enabling-the-input-method)).
+2. Install and enable **BrotypistInputMethod** only while testing the experimental registration path (see [Enabling the Input Method](#enabling-the-input-method)).
 3. Switch to it from the input-source menu in your menu bar.
 4. Type in any supported text field. Brotypist generates after a short debounce once there is enough text.
 5. Gray ghost text appears next to the caret — using the same caret position the focused app would use for IME composition.
@@ -175,20 +187,20 @@ See [First-Time Setup](#first-time-setup) for the build sequence and [Troublesho
 
 **`codesign` keeps prompting for the keychain password.** Run `./scripts/allow-dev-codesign-key.sh` once from an interactive terminal. It adds `/usr/bin/codesign` to the key's partition list so future signing is silent.
 
-**`BrotypistInputMethod` does not appear under Keyboard → Input Sources.** First make sure the bundle exists at `~/Library/Input Methods/BrotypistInputMethod.app`, then remove and rebuild:
+**`BrotypistInputMethod` does not appear under Keyboard → Input Sources.** The registration path is still experimental. First remove the installed bundle and restart the text-input agents:
 
 ```sh
 ./scripts/uninstall-dev-im.sh
-./scripts/build-dev-im.sh
+killall TextInputMenuAgent TextInputSwitcher imklaunchagent 2>/dev/null
 ```
 
-If it still does not appear, log out and back in so macOS rescans input methods, then add it manually from **System Settings → Keyboard → Input Sources → "+" → English**.
+Then rebuild without installing via `./scripts/build-dev-im.sh` until the bundle metadata/signing issue is fixed.
 
 **`build-dev-im.sh` reports the model is missing.** The script can still build the input method, but completions will fail until the model exists. Run `./scripts/download-model.sh`, then rebuild.
 
 **`codesign --verify` fails after a rebuild.** Usually the dev identity is missing — run `./scripts/create-dev-codesign-cert.sh`. The build script falls back to ad-hoc signing (`-`) when the identity is absent.
 
-**Want a one-off ad-hoc build (no cert).** `CODESIGN_IDENTITY=- ./scripts/build-dev-im.sh`. Useful only for throwaway tests.
+**Want a one-off ad-hoc build (no cert).** `CODESIGN_IDENTITY=- ./scripts/build-dev-im.sh`. Useful only for throwaway bundle-shape tests; do not install ad-hoc builds into Input Methods.
 
 **Want to watch what the app is doing.** Tail the unified log:
 
