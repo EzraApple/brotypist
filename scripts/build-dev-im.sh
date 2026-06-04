@@ -2,10 +2,12 @@
 set -euo pipefail
 
 CONFIGURATION="${CONFIGURATION:-debug}"
-APP_NAME="Brotypist"
-BUNDLE_ID="com.ezraapple.brotypist"
-DIST_DIR="dist"
-APP_PATH="${DIST_DIR}/${APP_NAME}.app"
+APP_NAME="BrotypistInputMethod"
+EXECUTABLE_NAME="brotypistim"
+BUNDLE_ID="com.ezraapple.brotypist.inputmethod"
+CONNECTION_NAME="BrotypistInputMethod_Connection"
+INSTALL_DIR="${HOME}/Library/Input Methods"
+APP_PATH="${INSTALL_DIR}/${APP_NAME}.app"
 CONTENTS_DIR="${APP_PATH}/Contents"
 MACOS_DIR="${CONTENTS_DIR}/MacOS"
 FRAMEWORKS_DIR="${CONTENTS_DIR}/Frameworks"
@@ -13,13 +15,14 @@ RESOURCES_DIR="${CONTENTS_DIR}/Resources"
 MODEL_FILE="qwen3-0.6b-base-q4_k_m.gguf"
 DEFAULT_CODESIGN_IDENTITY="Brotypist Local Development"
 
-swift build --product brotypist -c "${CONFIGURATION}"
+swift build --product "${EXECUTABLE_NAME}" -c "${CONFIGURATION}"
 BIN_DIR="$(swift build -c "${CONFIGURATION}" --show-bin-path)"
 
+mkdir -p "${INSTALL_DIR}"
 rm -rf "${APP_PATH}"
 mkdir -p "${MACOS_DIR}" "${FRAMEWORKS_DIR}" "${RESOURCES_DIR}"
 
-cp "${BIN_DIR}/brotypist" "${MACOS_DIR}/${APP_NAME}"
+cp "${BIN_DIR}/${EXECUTABLE_NAME}" "${MACOS_DIR}/${APP_NAME}"
 chmod +x "${MACOS_DIR}/${APP_NAME}"
 
 if [[ -d "${BIN_DIR}/llama.framework" ]]; then
@@ -37,7 +40,7 @@ if [[ -s "Models/${MODEL_FILE}" ]]; then
   mkdir -p "${RESOURCES_DIR}/Models"
   cp "Models/${MODEL_FILE}" "${RESOURCES_DIR}/Models/${MODEL_FILE}"
 else
-  echo "Model not copied; run ./scripts/download-model.sh to include it in the dev app bundle." >&2
+  echo "Model not copied; run ./scripts/download-model.sh first." >&2
 fi
 
 cat > "${CONTENTS_DIR}/Info.plist" <<PLIST
@@ -65,6 +68,49 @@ cat > "${CONTENTS_DIR}/Info.plist" <<PLIST
   <string>14.0</string>
   <key>LSUIElement</key>
   <true/>
+  <key>InputMethodConnectionName</key>
+  <string>${CONNECTION_NAME}</string>
+  <key>InputMethodServerControllerClass</key>
+  <string>BrotypistInputMethod.InputController</string>
+  <key>tsInputMethodCharacterRepertoireKey</key>
+  <array>
+    <string>en</string>
+  </array>
+  <key>ComponentInputModeDict</key>
+  <dict>
+    <key>tsInputModeListKey</key>
+    <dict>
+      <key>com.ezraapple.brotypist.inputmethod.default</key>
+      <dict>
+        <key>TISInputSourceID</key>
+        <string>com.ezraapple.brotypist.inputmethod.default</string>
+        <key>TISIntendedLanguage</key>
+        <string>en</string>
+        <key>tsInputModeAlternateMenuIconFileKey</key>
+        <string></string>
+        <key>tsInputModeCharacterRepertoireKey</key>
+        <array>
+          <string>en</string>
+        </array>
+        <key>tsInputModeDefaultStateKey</key>
+        <string>on</string>
+        <key>tsInputModeIsVisibleKey</key>
+        <true/>
+        <key>tsInputModeKeyEquivalentKey</key>
+        <string></string>
+        <key>tsInputModeKeyEquivalentModifiersKey</key>
+        <integer>0</integer>
+        <key>tsInputModeMenuIconFileKey</key>
+        <string></string>
+        <key>tsInputModePaletteIconFileKey</key>
+        <string></string>
+        <key>tsInputModePrimaryInScriptKey</key>
+        <true/>
+        <key>tsInputModeScriptKey</key>
+        <string>smRoman</string>
+      </dict>
+    </dict>
+  </dict>
 </dict>
 </plist>
 PLIST
@@ -81,4 +127,9 @@ codesign --force --deep --sign "${CODESIGN_IDENTITY}" "${APP_PATH}"
 
 echo "Built ${APP_PATH}"
 echo "Signed with: ${CODESIGN_IDENTITY}"
-echo "Open with: open ${APP_PATH}"
+echo
+echo "Activating input source..."
+swift run brotypistctl install-input-source 2>&1 | sed 's/^/  /' || true
+echo
+echo "If you don't see ghost text after this, switch to '${APP_NAME}'"
+echo "from the input-source menu in your menu bar (top right)."

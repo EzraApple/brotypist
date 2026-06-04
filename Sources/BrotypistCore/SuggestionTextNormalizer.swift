@@ -57,10 +57,37 @@ public enum SuggestionTextNormalizer {
             cleaned = words.prefix(maxWords).joined(separator: " ")
         }
 
+        let suggestionLower = cleaned.lowercased()
+        if !suggestionLower.isEmpty, input.lowercased().contains(suggestionLower) {
+            return ""
+        }
+
+        // Aggressive prefix-overlap strip: if the suggestion's first N words
+        // (N ≤ 6) match the input's last N words case-insensitively, drop them
+        // so only the new continuation remains.
+        cleaned = stripPrefixOverlap(suggestion: cleaned, input: input)
+        guard !cleaned.isEmpty else { return "" }
+
         let inputEndsWithWhitespace = input.last?.isWhitespace ?? false
         if hadLeadingWhitespace, !inputEndsWithWhitespace {
             return " " + cleaned
         }
         return cleaned
+    }
+
+    private static func stripPrefixOverlap(suggestion: String, input: String) -> String {
+        let inputWords = input.split { $0.isWhitespace || $0.isNewline }.map(String.init)
+        let suggestionWords = suggestion.split { $0.isWhitespace || $0.isNewline }.map(String.init)
+        guard !inputWords.isEmpty, !suggestionWords.isEmpty else { return suggestion }
+
+        let maxOverlap = min(6, inputWords.count, suggestionWords.count)
+        for k in stride(from: maxOverlap, through: 1, by: -1) {
+            let inputTail = inputWords.suffix(k).map { $0.lowercased() }
+            let suggestionHead = suggestionWords.prefix(k).map { $0.lowercased() }
+            if inputTail == suggestionHead {
+                return suggestionWords.dropFirst(k).joined(separator: " ")
+            }
+        }
+        return suggestion
     }
 }

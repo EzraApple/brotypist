@@ -2,9 +2,9 @@
 set -euo pipefail
 
 MODEL_DIR="Models"
-MODEL_FILE="Qwen3-0.6B-Q4_K_M.gguf"
+MODEL_FILE="qwen3-0.6b-base-q4_k_m.gguf"
 MODEL_PATH="${MODEL_DIR}/${MODEL_FILE}"
-MODEL_URL="https://huggingface.co/second-state/Qwen3-0.6B-GGUF/resolve/main/${MODEL_FILE}"
+MODEL_URL="https://huggingface.co/Antigma/Qwen3-0.6B-Base-GGUF/resolve/main/${MODEL_FILE}"
 
 mkdir -p "${MODEL_DIR}"
 

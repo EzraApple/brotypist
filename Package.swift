@@ -10,6 +10,7 @@ let package = Package(
     products: [
         .library(name: "BrotypistCore", targets: ["BrotypistCore"]),
         .executable(name: "brotypist", targets: ["BrotypistApp"]),
+        .executable(name: "brotypistim", targets: ["BrotypistInputMethod"]),
         .executable(name: "brotypistctl", targets: ["BrotypistCLI"])
     ],
     dependencies: [
@@ -29,12 +30,17 @@ let package = Package(
             dependencies: ["BrotypistCore", "BrotypistRuntime"]
         ),
         .executableTarget(
+            name: "BrotypistInputMethod",
+            dependencies: ["BrotypistCore", "BrotypistRuntime"]
+        ),
+        .executableTarget(
             name: "BrotypistCLI",
             dependencies: ["BrotypistCore", "BrotypistRuntime"]
         ),
         .testTarget(
             name: "BrotypistCoreTests",
-            dependencies: ["BrotypistCore"]
+            dependencies: ["BrotypistCore"],
+            resources: [.copy("Fixtures")]
         )
     ]
 )
