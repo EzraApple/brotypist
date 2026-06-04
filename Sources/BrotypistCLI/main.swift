@@ -137,8 +137,8 @@ func intFlag(_ name: String, args: [String]) -> Int? {
 }
 
 func runInstallInputSource(args: [String]) {
-    let bundleID = stringFlag("--bundle-id", args: args) ?? "com.ezraapple.brotypist.inputmethod"
-    let modeID = stringFlag("--mode-id", args: args) ?? "com.ezraapple.brotypist.inputmethod.default"
+    let bundleID = stringFlag("--bundle-id", args: args) ?? "com.ezraapple.inputmethod.Brotypist"
+    let modeID = stringFlag("--mode-id", args: args) ?? "com.ezraapple.inputmethod.Brotypist.Roman"
     let bundlePath = stringFlag("--bundle-path", args: args)
         ?? "\(NSHomeDirectory())/Library/Input Methods/BrotypistInputMethod.app"
     let timeout = doubleFlag("--timeout", args: args) ?? 3.0
@@ -150,29 +150,31 @@ func runInstallInputSource(args: [String]) {
         fail("bundle not found at \(bundlePath) — run scripts/build-dev-im.sh first")
     }
 
-    // Hint to the registry that there's a new bundle here. On Sequoia with a
-    // self-signed cert this is best-effort; the system may still require the
-    // user to add the input source manually the first time.
-    let registerStatus = TISRegisterInputSource(bundleURL as CFURL)
-    if registerStatus != noErr && registerStatus != paramErr {
-        print("warn: TISRegisterInputSource status=\(registerStatus)")
+    var source = findInputSource(bundleID: bundleID, modeID: modeID)
+    if source == nil {
+        // Hint to the registry that there's a new bundle here. This can also
+        // churn TIS' cache, so avoid calling it once the source is already
+        // visible after the PlugInKit scan.
+        let registerURLs = inputSourceBundleURLs(root: bundleURL)
+        for registerURL in registerURLs {
+            let registerStatus = TISRegisterInputSource(registerURL as CFURL)
+            if registerStatus != noErr && registerStatus != paramErr {
+                print("warn: TISRegisterInputSource \(registerURL.path) status=\(registerStatus)")
+            }
+        }
+
+        let deadline = Date().addingTimeInterval(timeout)
+        repeat {
+            source = findInputSource(bundleID: bundleID, modeID: modeID)
+            if source != nil { break }
+            Thread.sleep(forTimeInterval: 0.25)
+        } while Date() < deadline
     }
 
-    let deadline = Date().addingTimeInterval(timeout)
-    var source: TISInputSource?
-    repeat {
-        source = findInputSource(bundleID: bundleID, modeID: modeID)
-        if source != nil { break }
-        Thread.sleep(forTimeInterval: 0.25)
-    } while Date() < deadline
-
     guard let source else {
-        // First install on this Mac. Apple's flow requires the user to add the
-        // input source once via System Settings; afterwards our enable+select
-        // calls work for every rebuild.
-        print("Brotypist isn't registered with the input-source system yet — this is normal on first install.")
-        print("Add it once: System Settings → Keyboard → Input Sources → '+' → English → BrotypistInputMethod → Add.")
-        print("After that, this command will activate it automatically on every rebuild.")
+        print("Brotypist is not visible to the TIS input-source list yet.")
+        print("The dev install now registers the PlugInKit extension and restarts the text-input agents.")
+        print("If it still does not appear, check System Settings → Keyboard → Input Sources → '+' for Brotypist.")
         if openSettingsOnFailure {
             if let settingsURL = URL(string: "x-apple.systempreferences:com.apple.Keyboard-Settings.extension?InputSources") {
                 NSWorkspace.shared.open(settingsURL)
@@ -198,13 +200,10 @@ func runInstallInputSource(args: [String]) {
 }
 
 func findInputSource(bundleID: String, modeID: String) -> TISInputSource? {
-    let filter: CFDictionary = [
-        kTISPropertyBundleID as String: bundleID
-    ] as CFDictionary
-
-    guard let unmanaged = TISCreateInputSourceList(filter, true) else { return nil }
+    guard let unmanaged = TISCreateInputSourceList(nil, true) else { return nil }
     let cfList = unmanaged.takeRetainedValue()
     let count = CFArrayGetCount(cfList)
+    var bundleFallback: TISInputSource?
     for index in 0 ..< count {
         guard let raw = CFArrayGetValueAtIndex(cfList, index) else { continue }
         let source = Unmanaged<TISInputSource>.fromOpaque(raw).takeUnretainedValue()
@@ -213,8 +212,23 @@ func findInputSource(bundleID: String, modeID: String) -> TISInputSource? {
         if returned == modeID {
             return source
         }
+        if returned == bundleID {
+            bundleFallback = source
+        }
     }
-    return nil
+    return bundleFallback
+}
+
+func inputSourceBundleURLs(root: URL) -> [URL] {
+    let plugInsURL = root.appendingPathComponent("Contents/PlugIns", isDirectory: true)
+    let appexURLs = (try? FileManager.default.contentsOfDirectory(
+        at: plugInsURL,
+        includingPropertiesForKeys: [.isDirectoryKey],
+        options: [.skipsHiddenFiles]
+    ))?
+        .filter { $0.pathExtension == "appex" }
+        ?? []
+    return [root] + appexURLs
 }
 
 func stringFlag(_ name: String, args: [String]) -> String? {
