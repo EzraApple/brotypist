@@ -1,0 +1,76 @@
+{
+  "cases": [
+    {
+      "name": "anchors to the right of the caret with matching height",
+      "input": {
+        "caret_rect": {"x": 100, "y": 200, "w": 1, "h": 18},
+        "suggestion_size": {"w": 50, "h": 18},
+        "visible_frame": null
+      },
+      "expected_frame": {"x": 101, "y": 200, "w": 52, "h": 18}
+    },
+    {
+      "name": "rounds origin to nearest and width/height up",
+      "input": {
+        "caret_rect": {"x": 100.4, "y": 200.6, "w": 1, "h": 18.2},
+        "suggestion_size": {"w": 50.1, "h": 18},
+        "visible_frame": null
+      },
+      "expected_frame": {"x": 101, "y": 200, "w": 53, "h": 19}
+    },
+    {
+      "name": "expands vertically for multi-line suggestion (top-anchored)",
+      "input": {
+        "caret_rect": {"x": 100, "y": 200, "w": 1, "h": 18},
+        "suggestion_size": {"w": 200, "h": 54},
+        "visible_frame": null
+      },
+      "expected_frame": {"x": 101, "y": 164, "w": 202, "h": 54}
+    },
+    {
+      "name": "clips to visible right edge",
+      "input": {
+        "caret_rect": {"x": 980, "y": 100, "w": 1, "h": 18},
+        "suggestion_size": {"w": 100, "h": 18},
+        "visible_frame": {"x": 0, "y": 0, "w": 1000, "h": 800}
+      },
+      "expected_frame": {"x": 898, "y": 100, "w": 102, "h": 18}
+    },
+    {
+      "name": "clips to visible top edge",
+      "input": {
+        "caret_rect": {"x": 100, "y": 790, "w": 1, "h": 18},
+        "suggestion_size": {"w": 50, "h": 18},
+        "visible_frame": {"x": 0, "y": 0, "w": 1000, "h": 800}
+      },
+      "expected_frame": {"x": 101, "y": 782, "w": 52, "h": 18}
+    },
+    {
+      "name": "clips to visible bottom edge",
+      "input": {
+        "caret_rect": {"x": 100, "y": -5, "w": 1, "h": 18},
+        "suggestion_size": {"w": 50, "h": 18},
+        "visible_frame": {"x": 0, "y": 0, "w": 1000, "h": 800}
+      },
+      "expected_frame": {"x": 101, "y": 0, "w": 52, "h": 18}
+    },
+    {
+      "name": "clips to visible left edge when caret is off-screen left",
+      "input": {
+        "caret_rect": {"x": -50, "y": 100, "w": 1, "h": 18},
+        "suggestion_size": {"w": 50, "h": 18},
+        "visible_frame": {"x": 0, "y": 0, "w": 1000, "h": 800}
+      },
+      "expected_frame": {"x": 0, "y": 100, "w": 52, "h": 18}
+    },
+    {
+      "name": "does not clip when visible frame is null",
+      "input": {
+        "caret_rect": {"x": 10000, "y": 10000, "w": 1, "h": 18},
+        "suggestion_size": {"w": 50, "h": 18},
+        "visible_frame": null
+      },
+      "expected_frame": {"x": 10001, "y": 10000, "w": 52, "h": 18}
+    }
+  ]
+}

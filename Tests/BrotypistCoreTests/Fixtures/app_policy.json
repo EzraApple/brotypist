@@ -1,0 +1,14 @@
+{
+  "is_denied": {
+    "cases": [
+      {"name": "Terminal", "input": "Terminal", "expected": true},
+      {"name": "iTerm2", "input": "iTerm2", "expected": true},
+      {"name": "Ghostty", "input": "Ghostty", "expected": true},
+      {"name": "Warp", "input": "Warp", "expected": true},
+      {"name": "TextEdit", "input": "TextEdit", "expected": false},
+      {"name": "Slack", "input": "Slack", "expected": false},
+      {"name": "Safari", "input": "Safari", "expected": false},
+      {"name": "empty", "input": "", "expected": false}
+    ]
+  }
+}

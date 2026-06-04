@@ -1,0 +1,96 @@
+{
+  "quartz_to_appkit": {
+    "cases": [
+      {
+        "name": "single primary screen flips Y",
+        "input": {
+          "rect": {"x": 100, "y": 50, "w": 10, "h": 20},
+          "screens": [
+            {
+              "display_bounds_quartz": {"x": 0, "y": 0, "w": 1920, "h": 1080},
+              "appkit_frame": {"x": 0, "y": 0, "w": 1920, "h": 1080}
+            }
+          ]
+        },
+        "expected_rect": {"x": 100, "y": 1010, "w": 10, "h": 20}
+      },
+      {
+        "name": "secondary screen uses its own display bounds",
+        "input": {
+          "rect": {"x": 2000, "y": 50, "w": 10, "h": 20},
+          "screens": [
+            {
+              "display_bounds_quartz": {"x": 0, "y": 0, "w": 1920, "h": 1080},
+              "appkit_frame": {"x": 0, "y": 0, "w": 1920, "h": 1080}
+            },
+            {
+              "display_bounds_quartz": {"x": 1920, "y": 0, "w": 1920, "h": 1080},
+              "appkit_frame": {"x": 1920, "y": 0, "w": 1920, "h": 1080}
+            }
+          ]
+        },
+        "expected_rect": {"x": 2000, "y": 1010, "w": 10, "h": 20}
+      },
+      {
+        "name": "rect off all screens returns input unchanged",
+        "input": {
+          "rect": {"x": 5000, "y": 5000, "w": 10, "h": 20},
+          "screens": [
+            {
+              "display_bounds_quartz": {"x": 0, "y": 0, "w": 1920, "h": 1080},
+              "appkit_frame": {"x": 0, "y": 0, "w": 1920, "h": 1080}
+            }
+          ]
+        },
+        "expected_rect": {"x": 5000, "y": 5000, "w": 10, "h": 20}
+      }
+    ]
+  },
+  "screen_containing": {
+    "cases": [
+      {
+        "name": "rect inside primary screen",
+        "input": {
+          "rect": {"x": 100, "y": 100, "w": 10, "h": 10},
+          "screens": [
+            {
+              "display_bounds_quartz": {"x": 0, "y": 0, "w": 1920, "h": 1080},
+              "appkit_frame": {"x": 0, "y": 0, "w": 1920, "h": 1080}
+            }
+          ]
+        },
+        "expected_screen_index": 0
+      },
+      {
+        "name": "rect entirely off-screen returns null",
+        "input": {
+          "rect": {"x": 5000, "y": 5000, "w": 10, "h": 10},
+          "screens": [
+            {
+              "display_bounds_quartz": {"x": 0, "y": 0, "w": 1920, "h": 1080},
+              "appkit_frame": {"x": 0, "y": 0, "w": 1920, "h": 1080}
+            }
+          ]
+        },
+        "expected_screen_index": null
+      },
+      {
+        "name": "rect on secondary screen by corner",
+        "input": {
+          "rect": {"x": 1925, "y": 50, "w": 10, "h": 10},
+          "screens": [
+            {
+              "display_bounds_quartz": {"x": 0, "y": 0, "w": 1920, "h": 1080},
+              "appkit_frame": {"x": 0, "y": 0, "w": 1920, "h": 1080}
+            },
+            {
+              "display_bounds_quartz": {"x": 1920, "y": 0, "w": 1920, "h": 1080},
+              "appkit_frame": {"x": 1920, "y": 0, "w": 1920, "h": 1080}
+            }
+          ]
+        },
+        "expected_screen_index": 1
+      }
+    ]
+  }
+}

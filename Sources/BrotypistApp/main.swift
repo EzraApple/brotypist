@@ -11,6 +11,14 @@ private let suggestionLogger = Logger(subsystem: "com.ezraapple.brotypist", cate
 private let focusLogger = Logger(subsystem: "com.ezraapple.brotypist", category: "focus")
 private let completionDebounceNanoseconds: UInt64 = 220_000_000
 
+private let brotypistAXObserverCallback: AXObserverCallback = { _, _, _, refcon in
+    guard let refcon else { return }
+    let controller = Unmanaged<SuggestionController>.fromOpaque(refcon).takeUnretainedValue()
+    MainActor.assumeIsolated {
+        controller.handleObservedWindowGeometryChange()
+    }
+}
+
 @main
 @MainActor
 final class BrotypistApp: NSObject, NSApplicationDelegate {
@@ -43,7 +51,7 @@ final class BrotypistApp: NSObject, NSApplicationDelegate {
     }
 
     private static func defaultModelURL() -> URL {
-        let modelPath = "Models/Qwen3-0.6B-Q4_K_M.gguf"
+        let modelPath = "Models/qwen3-0.6b-base-q4_k_m.gguf"
         if let resourceURL = Bundle.main.resourceURL {
             let bundledModel = resourceURL.appendingPathComponent(modelPath)
             if FileManager.default.fileExists(atPath: bundledModel.path) {
@@ -98,6 +106,9 @@ private final class SuggestionController {
     private var lastAccessibilityTrusted: Bool?
     private var lastEventTapAttempt: Date?
     private var lastOverlayDiagnosticKey: String?
+    private var axObserver: AXObserver?
+    private var observedWindow: AXUIElement?
+    private var observedPID: pid_t = 0
 
     init(engine: any TextCompletionEngine) {
         self.engine = engine
@@ -158,12 +169,22 @@ private final class SuggestionController {
     }
 
     private func handleEvent(type: CGEventType, event: CGEvent) -> Unmanaged<CGEvent>? {
+        if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+            if let eventTap {
+                CGEvent.tapEnable(tap: eventTap, enable: true)
+                appLogger.info("Event tap re-enabled after disable=\(type.rawValue)")
+            }
+            return Unmanaged.passUnretained(event)
+        }
         guard type == .keyDown else { return Unmanaged.passUnretained(event) }
 
         let keycode = event.getIntegerValueField(.keyboardEventKeycode)
-        if keycode == kVK_Tab, acceptSuggestion() {
-            suggestionLogger.info("Tab accepted suggestion")
-            return nil
+        if keycode == kVK_Tab || keycode == kVK_RightArrow {
+            if acceptSuggestion() {
+                suggestionLogger.info("Accepted via keycode=\(keycode)")
+                return nil
+            }
+            suggestionLogger.debug("Accept skipped keycode=\(keycode) hasSession=\(self.activeSession != nil)")
         }
 
         if keycode == kVK_Escape, activeSession != nil {
@@ -172,9 +193,10 @@ private final class SuggestionController {
             return nil
         }
 
-        if keycode == kVK_Delete {
+        let hasCommand = event.flags.contains(.maskCommand)
+        if keycode == kVK_Delete, !hasCommand {
             clearSuggestion()
-        } else if event.unicodeString?.isEmpty == false {
+        } else if !hasCommand, event.unicodeString?.isEmpty == false {
             overlay.hide()
             generationTask?.cancel()
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.02) { [weak self] in
@@ -191,23 +213,38 @@ private final class SuggestionController {
             appLogger.info("Accessibility trusted=\(trusted)")
             lastAccessibilityTrusted = trusted
         }
+        if let eventTap, !CGEvent.tapIsEnabled(tap: eventTap) {
+            CGEvent.tapEnable(tap: eventTap, enable: true)
+            appLogger.info("Event tap re-enabled from poll")
+        }
         if eventTap == nil {
             startEventTap()
         }
 
         guard trusted else {
             overlay.hide()
+            teardownObserver()
             return
         }
 
         guard let context = FocusedTextReader.read() else {
             focusedContext = nil
             clearSuggestion()
+            teardownObserver()
             focusLogger.debug("No focused editable context")
             return
         }
 
+        if AppPolicy.isDenied(appName: context.appName) {
+            focusedContext = nil
+            clearSuggestion()
+            teardownObserver()
+            focusLogger.debug("Suppressed for denied app=\(context.appName, privacy: .public)")
+            return
+        }
+
         focusedContext = context
+        updateFocusObserver(for: context.element)
         guard let value = context.value else {
             overlay.hide()
             focusLogger.debug("Focused context has no readable value app=\(context.appName, privacy: .public)")
@@ -270,7 +307,7 @@ private final class SuggestionController {
                 appName: context.appName,
                 windowTitle: nil,
                 visualContext: nil,
-                maxPredictionWords: 6
+                maxPredictionWords: 12
             )
 
             do {
@@ -306,33 +343,43 @@ private final class SuggestionController {
     }
 
     private func shouldTriggerCompletion(_ text: String) -> Bool {
-        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return false }
-        if text.last?.isWhitespace == true { return true }
-
-        var currentWordLength = 0
-        for character in text.reversed() {
-            if character.isWhitespace { break }
-            currentWordLength += 1
-        }
-        return currentWordLength >= 2
+        TriggerRules.shouldTrigger(text)
     }
 
     private func currentLine(from text: String) -> String {
-        text.split(omittingEmptySubsequences: false, whereSeparator: \.isNewline).last.map(String.init) ?? text
+        TriggerRules.currentLine(from: text)
     }
 
     private func acceptSuggestion() -> Bool {
-        guard let activeSession else { return false }
+        guard let activeSession else {
+            suggestionLogger.debug("Accept: no active session")
+            return false
+        }
         let acceptance = activeSession.acceptNextWord()
-        guard !acceptance.accepted.isEmpty else { return false }
+        guard !acceptance.accepted.isEmpty else {
+            suggestionLogger.debug("Accept: acceptance was empty suggestion=\(activeSession.suggestion.debugDescription, privacy: .public)")
+            return false
+        }
 
-        if let context = focusedContext, FocusedTextWriter.insert(acceptance.accepted, into: context) {
+        let app = focusedContext?.appName ?? "?"
+        // Electron text views (Slack/Cursor/etc) tell AX the insertion succeeded
+        // but never apply the change to the DOM. We detect them by the caret
+        // source — when AX refused to return per-range bounds and we synthesized
+        // a caret from the element frame, we know the AX bridge is half-broken,
+        // so route insertion through the clipboard-paste path instead.
+        let needsPaste = focusedContext?.caret?.source.hasPrefix("element-frame") == true
+
+        if needsPaste {
+            ClipboardPaster.paste(acceptance.accepted)
             currentText += acceptance.accepted
-            suggestionLogger.info("Accepted via AX insertion length=\(acceptance.accepted.count)")
+            suggestionLogger.info("Accepted via clipboard paste app=\(app, privacy: .public) length=\(acceptance.accepted.count)")
+        } else if let context = focusedContext, FocusedTextWriter.insert(acceptance.accepted, into: context) {
+            currentText += acceptance.accepted
+            suggestionLogger.info("Accepted via AX insertion app=\(app, privacy: .public) length=\(acceptance.accepted.count)")
         } else {
             KeyboardTyper.type(acceptance.accepted)
             currentText += acceptance.accepted
-            suggestionLogger.info("Accepted via keyboard fallback length=\(acceptance.accepted.count)")
+            suggestionLogger.info("Accepted via keyboard fallback app=\(app, privacy: .public) length=\(acceptance.accepted.count)")
         }
 
         self.activeSession = acceptance.remaining
@@ -378,7 +425,7 @@ private final class SuggestionController {
         lastOverlayDiagnosticKey = key
 
         suggestionLogger.info(
-            "Overlay geometry app=\(context.appName, privacy: .public) source=\(caret.source, privacy: .public) caretX=\(caretRect.origin.x) caretY=\(caretRect.origin.y) caretHeight=\(caretRect.height) rawY=\(caret.rawRect.origin.y) convertedY=\(caret.convertedRect.origin.y) font=\(font.fontName, privacy: .public) fontSize=\(font.pointSize) lineHeight=\(lineHeight) suggestionLength=\(suggestionLength)"
+            "Overlay geometry app=\(context.appName, privacy: .public) source=\(caret.source, privacy: .public) caretX=\(caretRect.origin.x) caretY=\(caretRect.origin.y) caretHeight=\(caretRect.height) rawY=\(caret.rawRect.origin.y) convertedY=\(caret.convertedRect.origin.y) font=\(font.fontName, privacy: .public) fontSize=\(font.pointSize) fontLineHeight=\(lineHeight) suggestionLength=\(suggestionLength)"
         )
     }
 
@@ -394,6 +441,89 @@ private final class SuggestionController {
         isGenerating = false
         lastOverlayDiagnosticKey = nil
         overlay.hide()
+    }
+
+    fileprivate func handleObservedWindowGeometryChange() {
+        guard
+            let context = focusedContext,
+            let session = activeSession,
+            let range = FocusedTextReader.readSelectedRange(context.element),
+            let caret = FocusedTextReader.caretGeometry(for: context.element, range: range, value: context.value, font: context.font)
+        else {
+            return
+        }
+
+        focusedContext = FocusedTextContext(
+            element: context.element,
+            value: context.value,
+            selectedRange: range,
+            caret: caret,
+            font: context.font,
+            appName: context.appName
+        )
+
+        let font = OverlayTypography.displayFont(reportedFont: context.font, caretHeight: caret.screenRect.height)
+        overlay.update(text: session.suggestion, font: font, caretRect: caret.screenRect)
+    }
+
+    private func updateFocusObserver(for element: AXUIElement) {
+        let window = focusedWindow(for: element)
+
+        if let observedWindow, let window, CFEqual(observedWindow, window) {
+            return
+        }
+
+        teardownObserver()
+
+        guard let window else { return }
+
+        var pid: pid_t = 0
+        guard AXUIElementGetPid(element, &pid) == .success, pid > 0 else { return }
+
+        var observer: AXObserver?
+        guard AXObserverCreate(pid, brotypistAXObserverCallback, &observer) == .success,
+              let observer else {
+            return
+        }
+
+        let refcon = UnsafeMutableRawPointer(Unmanaged.passUnretained(self).toOpaque())
+        _ = AXObserverAddNotification(observer, window, kAXMovedNotification as CFString, refcon)
+        _ = AXObserverAddNotification(observer, window, kAXResizedNotification as CFString, refcon)
+        CFRunLoopAddSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(observer), .commonModes)
+
+        self.axObserver = observer
+        self.observedWindow = window
+        self.observedPID = pid
+        focusLogger.debug("AX observer attached pid=\(pid)")
+    }
+
+    private func teardownObserver() {
+        guard let observer = axObserver else { return }
+        CFRunLoopRemoveSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(observer), .commonModes)
+        if let observedWindow {
+            _ = AXObserverRemoveNotification(observer, observedWindow, kAXMovedNotification as CFString)
+            _ = AXObserverRemoveNotification(observer, observedWindow, kAXResizedNotification as CFString)
+        }
+        axObserver = nil
+        observedWindow = nil
+        observedPID = 0
+    }
+
+    private func focusedWindow(for element: AXUIElement) -> AXUIElement? {
+        if let window = copyAXElement(element, attribute: kAXWindowAttribute as CFString) {
+            return window
+        }
+        return copyAXElement(element, attribute: kAXTopLevelUIElementAttribute as CFString)
+    }
+
+    private func copyAXElement(_ element: AXUIElement, attribute: CFString) -> AXUIElement? {
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, attribute, &value) == .success,
+              let value,
+              CFGetTypeID(value) == AXUIElementGetTypeID() else {
+            return nil
+        }
+        return unsafeBitCast(value, to: AXUIElement.self)
     }
 }
 
@@ -428,17 +558,27 @@ private enum FocusedTextReader {
         let element = resolveEditableElement(from: focused) ?? focused
         let value = readString(element, attribute: kAXValueAttribute as CFString)
         let range = readSelectedRange(element)
-        let caret = range.flatMap { selection in
-            Self.caretGeometry(for: element, range: selection)
+        let axFont = readFont(element: element, value: value, range: range)
+        let appName = NSWorkspace.shared.frontmostApplication?.localizedName ?? "Unknown"
+        let hintFont = AppFontHints.hint(for: appName).flatMap { spec in
+            NSFont(name: spec.name, size: spec.pointSize) ?? NSFont.systemFont(ofSize: spec.pointSize)
         }
-        let font = readFont(element: element, value: value, range: range)
+        let resolvedFont = axFont ?? hintFont
+        let caret = range.flatMap { selection in
+            Self.caretGeometry(for: element, range: selection, value: value, font: resolvedFont)
+        }
+        // If we still have no font and we fell back to an element-frame caret
+        // (Electron-style AX bridge), default the overlay to 15pt so it isn't
+        // dwarfed by the surrounding body text.
+        let effectiveFont = resolvedFont
+            ?? ((caret?.source.hasPrefix("element-frame") == true) ? NSFont.systemFont(ofSize: 15) : nil)
         return FocusedTextContext(
             element: element,
             value: value,
             selectedRange: range,
             caret: caret,
-            font: font,
-            appName: NSWorkspace.shared.frontmostApplication?.localizedName ?? "Unknown"
+            font: effectiveFont,
+            appName: appName
         )
     }
 
@@ -528,7 +668,7 @@ private enum FocusedTextReader {
         return number.boolValue
     }
 
-    private static func readSelectedRange(_ element: AXUIElement) -> CFRange? {
+    fileprivate static func readSelectedRange(_ element: AXUIElement) -> CFRange? {
         var value: CFTypeRef?
         guard AXUIElementCopyAttributeValue(element, kAXSelectedTextRangeAttribute as CFString, &value) == .success,
               let value,
@@ -540,31 +680,89 @@ private enum FocusedTextReader {
         return range
     }
 
-    private static func caretGeometry(for element: AXUIElement, range: CFRange) -> CaretGeometry? {
+    fileprivate static func caretGeometry(for element: AXUIElement, range: CFRange, value: String?, font: NSFont?) -> CaretGeometry? {
         var caretRange = CFRange(location: range.location, length: 0)
         if let rect = bounds(for: element, range: caretRange), rect.height > 2 {
-            return geometry(from: rect)
+            return geometry(from: rect, source: "bounds")
         }
         if range.location > 0 {
             caretRange = CFRange(location: range.location - 1, length: 1)
             if let rect = bounds(for: element, range: caretRange), rect.height > 2 {
-                return geometry(from: CGRect(x: rect.maxX, y: rect.minY, width: 0, height: rect.height))
+                return geometry(from: CGRect(x: rect.maxX, y: rect.minY, width: 0, height: rect.height), source: "trailing")
             }
+        }
+        if let fallback = elementFrameCaret(for: element, range: range, value: value, font: font) {
+            return geometry(from: fallback, source: "element-frame")
         }
         return nil
     }
 
-    private static func geometry(from rawRect: CGRect) -> CaretGeometry {
-        let convertedRect = convertQuartzToAppKit(rawRect)
-        let convertedScreen = screen(containing: convertedRect)
+    private static func geometry(from rawRect: CGRect, source: String) -> CaretGeometry {
+        let screens = currentScreens()
+        let convertedRect = CoordinateSpace.quartzToAppKit(rawRect, screens: screens)
+        let convertedScreen = CoordinateSpace.screen(containing: convertedRect, in: screens)
 
         if convertedScreen != nil {
-            return CaretGeometry(rawRect: rawRect, convertedRect: convertedRect, screenRect: convertedRect, source: "converted")
+            return CaretGeometry(rawRect: rawRect, convertedRect: convertedRect, screenRect: convertedRect, source: source)
         }
-        if screen(containing: rawRect) != nil {
-            return CaretGeometry(rawRect: rawRect, convertedRect: convertedRect, screenRect: rawRect, source: "raw-fallback")
+        if CoordinateSpace.screen(containing: rawRect, in: screens) != nil {
+            return CaretGeometry(rawRect: rawRect, convertedRect: convertedRect, screenRect: rawRect, source: "\(source)-raw")
         }
-        return CaretGeometry(rawRect: rawRect, convertedRect: convertedRect, screenRect: convertedRect, source: "converted-offscreen")
+        return CaretGeometry(rawRect: rawRect, convertedRect: convertedRect, screenRect: convertedRect, source: "\(source)-offscreen")
+    }
+
+    fileprivate static func currentScreens() -> [ScreenSpace] {
+        NSScreen.screens.compactMap { screen in
+            guard let displayID = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID else {
+                return nil
+            }
+            return ScreenSpace(displayBoundsInQuartz: CGDisplayBounds(displayID), appKitFrame: screen.frame)
+        }
+    }
+
+    private static func elementFrameCaret(for element: AXUIElement, range: CFRange, value: String?, font: NSFont?) -> CGRect? {
+        guard let frame = elementFrame(element), frame.width > 4, frame.height > 4 else { return nil }
+        // Prefer the AX-reported font when present; otherwise lean wider so the
+        // suggestion overshoots instead of overlapping with the user's last
+        // character (Electron apps rarely return per-range bounds OR a usable
+        // font, so we measure with a generous default).
+        let estimateFont = font ?? NSFont.systemFont(ofSize: 18)
+        // Use the font's actual space width as the gap so it tracks the font
+        // size instead of a hard-coded pixel value.
+        let gap = (" " as NSString).size(withAttributes: [.font: estimateFont]).width
+        let prefix = textUpToCursor(value: value, location: range.location)
+        let lastLine = TriggerRules.currentLine(from: prefix)
+        let textWidth = (lastLine as NSString).size(withAttributes: [.font: estimateFont]).width + gap
+        // 22pt line box matches typical 15pt body text — Slack/Cursor render
+        // around there, and the overlay's display font scales to fit this.
+        let caret = OverlayLayout.fallbackCaret(elementFrame: frame, cursorTextWidth: textWidth, lineHeight: 22)
+        focusLogger.debug("element-frame caret frame=\(frame.debugDescription, privacy: .public) font=\(estimateFont.fontName, privacy: .public)@\(estimateFont.pointSize) textWidth=\(textWidth) caret=\(caret.debugDescription, privacy: .public)")
+        return caret
+    }
+
+    private static func textUpToCursor(value: String?, location: Int) -> String {
+        guard let value, location >= 0 else { return value ?? "" }
+        let nsValue = value as NSString
+        let clamped = max(0, min(location, nsValue.length))
+        return nsValue.substring(to: clamped)
+    }
+
+    private static func elementFrame(_ element: AXUIElement) -> CGRect? {
+        var positionValue: CFTypeRef?
+        var sizeValue: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, kAXPositionAttribute as CFString, &positionValue) == .success,
+              let positionValue,
+              CFGetTypeID(positionValue) == AXValueGetTypeID(),
+              AXUIElementCopyAttributeValue(element, kAXSizeAttribute as CFString, &sizeValue) == .success,
+              let sizeValue,
+              CFGetTypeID(sizeValue) == AXValueGetTypeID() else {
+            return nil
+        }
+        var position = CGPoint.zero
+        var size = CGSize.zero
+        guard AXValueGetValue(positionValue as! AXValue, .cgPoint, &position) else { return nil }
+        guard AXValueGetValue(sizeValue as! AXValue, .cgSize, &size) else { return nil }
+        return CGRect(origin: position, size: size)
     }
 
     private static func bounds(for element: AXUIElement, range: CFRange) -> CGRect? {
@@ -619,35 +817,6 @@ private enum FocusedTextReader {
         return nil
     }
 
-    private static func convertQuartzToAppKit(_ rect: CGRect) -> CGRect {
-        let center = CGPoint(x: rect.midX, y: rect.midY)
-        for screen in NSScreen.screens {
-            guard let displayID = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID else {
-                continue
-            }
-            let displayBounds = CGDisplayBounds(displayID)
-            if displayBounds.contains(center) {
-                return CGRect(
-                    x: rect.origin.x - displayBounds.origin.x + screen.frame.origin.x,
-                    y: (displayBounds.origin.y + displayBounds.height) - (rect.origin.y + rect.height) + screen.frame.origin.y,
-                    width: rect.width,
-                    height: rect.height
-                )
-            }
-        }
-        return rect
-    }
-
-    private static func screen(containing rect: CGRect) -> NSScreen? {
-        let candidates = [
-            CGPoint(x: rect.midX, y: rect.midY),
-            CGPoint(x: rect.minX, y: rect.minY),
-            CGPoint(x: rect.maxX, y: rect.maxY)
-        ]
-        return NSScreen.screens.first { screen in
-            candidates.contains { screen.frame.insetBy(dx: -4, dy: -4).contains($0) }
-        }
-    }
 }
 
 private enum FocusedTextWriter {
@@ -682,23 +851,23 @@ private final class SuggestionOverlayWindow: NSPanel {
             return
         }
 
-        let metrics = OverlayTypography.metrics(for: font, caretHeight: caretRect.height)
-        let size = (text as NSString).size(withAttributes: [.font: font])
-        let height = ceil(max(caretRect.height, metrics.lineHeight, size.height))
-        var frame = CGRect(
-            x: caretRect.maxX,
-            y: caretRect.minY + ((caretRect.height - height) / 2),
-            width: ceil(size.width) + 2,
-            height: height
-        )
+        let caretCenter = CGPoint(x: caretRect.midX, y: caretRect.midY)
+        let visible = NSScreen.screens.first(where: { $0.frame.contains(caretCenter) })?.visibleFrame
+            ?? NSScreen.main?.visibleFrame
+        let availableWidth: CGFloat = {
+            guard let visible else { return .greatestFiniteMagnitude }
+            return max(120, visible.maxX - caretRect.maxX - 16)
+        }()
 
-        if let visible = NSScreen.screens.first(where: { $0.frame.contains(caretRect.center) })?.visibleFrame ?? NSScreen.main?.visibleFrame {
-            if frame.maxX > visible.maxX { frame.origin.x = visible.maxX - frame.width }
-            if frame.minX < visible.minX { frame.origin.x = visible.minX }
-            if frame.maxY > visible.maxY { frame.origin.y = visible.maxY - frame.height }
-            if frame.minY < visible.minY { frame.origin.y = visible.minY }
-        }
-        frame = frame.roundedForStableOverlay()
+        let attrs: [NSAttributedString.Key: Any] = [.font: font]
+        let attributed = NSAttributedString(string: text, attributes: attrs)
+        let bounds = attributed.boundingRect(
+            with: CGSize(width: availableWidth, height: .greatestFiniteMagnitude),
+            options: [.usesLineFragmentOrigin, .usesFontLeading]
+        )
+        let size = CGSize(width: bounds.width, height: bounds.height)
+
+        let frame = OverlayLayout.frame(caretRect: caretRect, suggestionSize: size, visibleFrame: visible)
 
         let sameText = textView.text == text
         let sameFont = textView.font.fontName == font.fontName && abs(textView.font.pointSize - font.pointSize) < 0.1
@@ -706,7 +875,7 @@ private final class SuggestionOverlayWindow: NSPanel {
             return
         }
 
-        textView.update(text: text, font: font, baselineOffset: metrics.baselineOffset)
+        textView.update(text: text, font: font)
         setFrame(frame, display: false)
         textView.frame = CGRect(origin: .zero, size: frame.size)
         textView.needsDisplay = true
@@ -725,14 +894,14 @@ private final class SuggestionOverlayWindow: NSPanel {
 private final class SuggestionOverlayView: NSView {
     private(set) var text = ""
     private(set) var font = NSFont.systemFont(ofSize: NSFont.systemFontSize)
-    private var baselineOffset: CGFloat = 0
 
+    // Flipped so multi-line suggestions read top-to-bottom: first line at the
+    // caret, additional lines below.
     override var isFlipped: Bool { true }
 
-    func update(text: String, font: NSFont, baselineOffset: CGFloat) {
+    func update(text: String, font: NSFont) {
         self.text = text
         self.font = font
-        self.baselineOffset = baselineOffset
     }
 
     override func draw(_ dirtyRect: NSRect) {
@@ -743,17 +912,12 @@ private final class SuggestionOverlayView: NSView {
             .font: font,
             .foregroundColor: NSColor.tertiaryLabelColor
         ]
-        let y = max(0, floor((bounds.height - OverlayTypography.metrics(for: font, caretHeight: bounds.height).lineHeight) / 2 + baselineOffset))
-        (text as NSString).draw(at: CGPoint(x: 0, y: y), withAttributes: attributes)
+        let attributed = NSAttributedString(string: text, attributes: attributes)
+        attributed.draw(with: bounds, options: [.usesLineFragmentOrigin, .usesFontLeading])
     }
 }
 
 private enum OverlayTypography {
-    struct Metrics {
-        let lineHeight: CGFloat
-        let baselineOffset: CGFloat
-    }
-
     static func displayFont(reportedFont: NSFont?, caretHeight: CGFloat) -> NSFont {
         guard caretHeight.isFinite, caretHeight > 4 else {
             return reportedFont ?? .systemFont(ofSize: NSFont.systemFontSize)
@@ -770,26 +934,58 @@ private enum OverlayTypography {
 
         return NSFont(descriptor: baseFont.fontDescriptor, size: targetSize) ?? .systemFont(ofSize: targetSize)
     }
-
-    static func metrics(for font: NSFont, caretHeight: CGFloat) -> Metrics {
-        let lineHeight = ceil(max(1, font.ascender - font.descender + font.leading))
-        let extraCaretSpace = max(0, caretHeight - lineHeight)
-        return Metrics(lineHeight: lineHeight, baselineOffset: floor(extraCaretSpace / 2))
-    }
 }
 
-private extension CGRect {
-    var center: CGPoint {
-        CGPoint(x: midX, y: midY)
+private enum ClipboardPaster {
+    static func paste(_ text: String) {
+        let pasteboard = NSPasteboard.general
+        let saved = capture(pasteboard)
+
+        pasteboard.clearContents()
+        pasteboard.setString(text, forType: .string)
+
+        synthesizePaste()
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+            restore(pasteboard, saved: saved)
+        }
     }
 
-    func roundedForStableOverlay() -> CGRect {
-        CGRect(
-            x: origin.x.rounded(.toNearestOrAwayFromZero),
-            y: origin.y.rounded(.toNearestOrAwayFromZero),
-            width: width.rounded(.up),
-            height: height.rounded(.up)
-        )
+    private static func capture(_ pasteboard: NSPasteboard) -> [[NSPasteboard.PasteboardType: Data]] {
+        guard let items = pasteboard.pasteboardItems else { return [] }
+        return items.map { item in
+            var dict: [NSPasteboard.PasteboardType: Data] = [:]
+            for type in item.types {
+                if let data = item.data(forType: type) {
+                    dict[type] = data
+                }
+            }
+            return dict
+        }
+    }
+
+    private static func restore(_ pasteboard: NSPasteboard, saved: [[NSPasteboard.PasteboardType: Data]]) {
+        guard !saved.isEmpty else { return }
+        pasteboard.clearContents()
+        let items = saved.map { dict -> NSPasteboardItem in
+            let item = NSPasteboardItem()
+            for (type, data) in dict {
+                item.setData(data, forType: type)
+            }
+            return item
+        }
+        pasteboard.writeObjects(items)
+    }
+
+    private static func synthesizePaste() {
+        guard let source = CGEventSource(stateID: .combinedSessionState) else { return }
+        let vKey: CGKeyCode = 9
+        let down = CGEvent(keyboardEventSource: source, virtualKey: vKey, keyDown: true)
+        down?.flags = .maskCommand
+        down?.post(tap: .cghidEventTap)
+        let up = CGEvent(keyboardEventSource: source, virtualKey: vKey, keyDown: false)
+        up?.flags = .maskCommand
+        up?.post(tap: .cghidEventTap)
     }
 }
 

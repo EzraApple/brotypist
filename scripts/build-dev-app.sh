@@ -10,7 +10,7 @@ CONTENTS_DIR="${APP_PATH}/Contents"
 MACOS_DIR="${CONTENTS_DIR}/MacOS"
 FRAMEWORKS_DIR="${CONTENTS_DIR}/Frameworks"
 RESOURCES_DIR="${CONTENTS_DIR}/Resources"
-MODEL_FILE="Qwen3-0.6B-Q4_K_M.gguf"
+MODEL_FILE="qwen3-0.6b-base-q4_k_m.gguf"
 DEFAULT_CODESIGN_IDENTITY="Brotypist Local Development"
 
 swift build --product brotypist -c "${CONFIGURATION}"

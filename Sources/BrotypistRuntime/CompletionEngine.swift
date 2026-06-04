@@ -40,16 +40,22 @@ public struct LlamaCompletionOptions: Sendable {
     public var topK: Int32
     public var topP: Float
     public var minP: Float
+    public var repeatPenalty: Float
+    public var presencePenalty: Float
+    public var penaltyLastN: Int32
     public var seed: UInt32
 
     public init(
-        maxPredictionTokens: Int = 12,
+        maxPredictionTokens: Int = 24,
         contextTokens: Int32 = 2048,
         batchTokens: Int32 = 512,
-        temperature: Float = 0.0,
-        topK: Int32 = 20,
+        temperature: Float = 0.35,
+        topK: Int32 = 40,
         topP: Float = 0.9,
         minP: Float = 0.05,
+        repeatPenalty: Float = 1.1,
+        presencePenalty: Float = 1.5,
+        penaltyLastN: Int32 = 64,
         seed: UInt32 = 0
     ) {
         self.maxPredictionTokens = max(1, maxPredictionTokens)
@@ -59,6 +65,9 @@ public struct LlamaCompletionOptions: Sendable {
         self.topK = topK
         self.topP = topP
         self.minP = minP
+        self.repeatPenalty = repeatPenalty
+        self.presencePenalty = presencePenalty
+        self.penaltyLastN = penaltyLastN
         self.seed = seed
     }
 }
@@ -155,7 +164,9 @@ public actor LlamaCompletionEngine: TextCompletionEngine {
             }
 
             let piece = pieceString(for: nextToken, vocab: vocab)
-            if piece.contains("<|") { break }
+            if piece.contains("<|im_end|>") || piece.contains("<|endoftext|>") || piece.contains("<|") {
+                break
+            }
 
             generated += piece
             llama_sampler_accept(sampler, nextToken)
@@ -271,6 +282,18 @@ public actor LlamaCompletionEngine: TextCompletionEngine {
     private func makeSampler() throws -> UnsafeMutablePointer<llama_sampler> {
         guard let sampler = llama_sampler_chain_init(llama_sampler_chain_default_params()) else {
             throw CompletionEngineError.generationFailed("Unable to initialize sampler.")
+        }
+
+        // Penalties first so they apply before truncation reduces the candidate set.
+        if options.repeatPenalty != 1.0 || options.presencePenalty != 0.0 {
+            if let penalties = llama_sampler_init_penalties(
+                options.penaltyLastN,
+                options.repeatPenalty,
+                0.0,
+                options.presencePenalty
+            ) {
+                llama_sampler_chain_add(sampler, penalties)
+            }
         }
 
         if options.topK > 0, let topK = llama_sampler_init_top_k(options.topK) {

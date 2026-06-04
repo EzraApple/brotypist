@@ -1,0 +1,23 @@
+{
+  "should_trigger": {
+    "cases": [
+      {"name": "empty string", "input": "", "expected": false},
+      {"name": "whitespace only", "input": "   ", "expected": false},
+      {"name": "single non-space char", "input": "a", "expected": false},
+      {"name": "two chars", "input": "ab", "expected": true},
+      {"name": "trailing space", "input": "Can you ", "expected": true},
+      {"name": "trailing newline", "input": "Can you\n", "expected": true},
+      {"name": "multi-line short last word", "input": "Hello\na", "expected": false},
+      {"name": "multi-line long last word", "input": "Hello\nworld", "expected": true}
+    ]
+  },
+  "current_line": {
+    "cases": [
+      {"name": "single line", "input": "hello", "expected": "hello"},
+      {"name": "two lines returns the second", "input": "first\nsecond", "expected": "second"},
+      {"name": "trailing newline yields empty", "input": "first\n", "expected": ""},
+      {"name": "empty input", "input": "", "expected": ""},
+      {"name": "only newlines", "input": "\n\n", "expected": ""}
+    ]
+  }
+}
